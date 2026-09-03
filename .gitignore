@@ -1,0 +1,10 @@
+venv
+.env
+.env
+__pycache__
+.pyc
+chroma_db
+.vscode
+.idea
+.log
+.pdf
