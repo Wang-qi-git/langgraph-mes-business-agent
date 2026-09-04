@@ -1,121 +1,118 @@
 import streamlit as st
 import os
-from agent_demo import (
-    run_workflow,
-    init_kb,
-    embedding,
-    KB_FILE,
-    persist_path,
-    _KB_INITIALIZED
+from dotenv import load_dotenv
+from pathlib import Path
+
+# 直接导入编译完成的LangGraph graph对象
+from graph_agent_skeleton import graph
+
+# 加载.env环境变量
+load_dotenv(".env")
+
+st.set_page_config(
+    page_title="AI‑Agent 作品集演示Demo",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+# 深色主题CSS
+css = """
+<style>
+*{box-sizing:border-box;}
+.stApp {background-color:#17171a;color:#eee;}
+header[data-testid="stHeader"]{display:none !important;}
+[data-testid="stSidebar"]{background-color:#212127;}
+div[data-testid="stChatMessage-user"]{
+    background-color:#2550ea;
+    border-radius:16px 16px 4px 16px;
+    padding:12px 16px;
+    margin:8px 0;
+}
+div[data-testid="stChatMessage-assistant"]{
+    background-color:#2a2a33;
+    border-radius:16px 16px 16px 4px;
+    padding:12px 16px;
+    margin:8px 0;
+}
+</style>
+"""
+st.markdown(css, unsafe_allow_html=True)
 
-st.set_page_config(page_title="MES智能制造知识库智能Agent｜作品集演示Demo", layout="wide")
-st.title("MES智能制造知识库智能Agent｜作品集演示Demo")
+# 侧边栏
+with st.sidebar:
+    st.title("🤖 AI Agent Demo")
+    st.markdown("**作品集演示：LangGraph + RAG + Tavily搜索 + 报告生成**")
+    st.divider()
 
-# ==========会话状态初始化==========
-if "kb_ready" not in st.session_state:
-    with st.spinner("正在加载私有知识库..."):
-        init_kb()
-        st.session_state.kb_ready = True
+    uploaded_pdf = st.file_uploader("上传PDF知识库", type=["pdf"])
+    pdf_save_dir = Path("./pdf_docs")
+    pdf_save_dir.mkdir(exist_ok=True)
 
-# 对话历史存储
+    if uploaded_pdf is not None:
+        save_path = pdf_save_dir / uploaded_pdf.name
+        with open(save_path, "wb") as f:
+            f.write(uploaded_pdf.getbuffer())
+        st.success(f"已保存:{uploaded_pdf.name}，重启程序载入向量库")
+
+    st.divider()
+    if st.button("🔄 清空对话会话"):
+        st.session_state.chat_history = []
+        st.rerun()
+
+# 初始化会话记忆
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-# =========侧边栏知识库管理=========
-with st.sidebar:
-    st.header("知识库管理")
-    st.markdown("方式1：本地kb.md私有业务知识库")
-    if st.button("重新加载私有知识库"):
-        init_kb()
-        st.success("✅知识库重新加载完成")
-    st.divider()
-    st.markdown("方式2：上传PDF临时业务文档")
-    uploaded_pdf = st.file_uploader("上传PDF文档", type=["pdf"])
-    if uploaded_pdf is not None:
-        if st.button("解析PDF并加载"):
-            temp_path = "./temp_upload.pdf"
-            with open(temp_path, "wb") as f:
-                f.write(uploaded_pdf.getbuffer())
-            loader = PyPDFLoader(temp_path)
-            pages = loader.load()
-            splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
-            chunks = splitter.split_documents(pages)
-            from langchain_chroma import Chroma
-            vs = Chroma(persist_directory=persist_path, embedding_function=embedding)
-            vs.add_documents(chunks)
-            st.success(f"✅PDF解析完成，生成 {len(chunks)} 个切片")
-    st.divider()
-    if st.button("清空对话历史"):
-        st.session_state.chat_history.clear()
-        st.rerun()
+# 渲染历史对话
+for msg in st.session_state.chat_history:
+    with st.chat_message(msg["role"]):
+        if msg["role"] == "assistant":
+            if msg.get("thinking_log"):
+                with st.status("🔍 Agent思考&执行过程", expanded=False):
+                    st.write(msg["thinking_log"])
+        st.markdown(msg["content"])
+        if msg.get("report_md"):
+            st.download_button(
+                label="📥 下载生成报告(Markdown)",
+                data=msg["report_md"],
+                file_name="agent_generated_report.md",
+                mime="text/markdown"
+            )
 
-# =========渲染历史对话==========
-st.subheader("📜历史对话记录")
-for idx, (q, a, trace_data) in enumerate(st.session_state.chat_history):
-    st.markdown(f"**👤提问：** {q}")
-    st.markdown(f"**📋输出结果：**\n{a}")
-    with st.expander("🔍查看Agent内部工作过程"):
-        st.markdown(f"**调度Agent分类：** {trace_data['route_type']}")
-        st.markdown("**检索素材片段：**")
-        for doc_text in trace_data["retrieve_docs"]:
-            st.code(doc_text, language="text")
-        st.markdown(f"**事实校验结果：** {trace_data['fact_check']}")
-        st.markdown(f"**是否使用联网搜索：** {trace_data['has_web_source']}")
-    st.divider()
+# 聊天输入框
+user_query = st.chat_input(placeholder="输入问题，Agent联网搜索+PDF私有知识库，输出分析报告...")
 
-# =========业务提问区==========
-st.subheader("业务提问输入")
-user_query = st.text_area(
-    "请输入你的问题，支持问答、分析、生成Markdown报告",
-    placeholder="示例：解释OEE指标；写一份MES可信报工风险评估报告",
-    height=140
-)
-submit_btn = st.button("🚀执行Agent工作流", type="primary")
+if user_query:
+    st.session_state.chat_history.append({"role":"user","content":user_query})
+    with st.chat_message("user"):
+        st.markdown(user_query)
 
-if submit_btn and user_query.strip():
-    with st.spinner("Agent流水线执行：检索→调度路由→事实校验→生成报告，稍等..."):
-        resp = run_workflow(user_query.strip())
+    with st.chat_message("assistant"):
+        with st.status("🤖 Agent运行中：检索/搜索/推理...", expanded=True) as status:
+            # 调用LangGraph
+            inputs = {"question": user_query}
+            result = graph.invoke(inputs)
 
-    # 关键修复：判断返回是字符串还是字典，防止 TypeError string indices must be integers
-    if isinstance(resp, str):
-        result = resp
-        trace_info = {
-            "route_type": "直接返回字符串",
-            "retrieve_docs": [],
-            "fact_check": "无",
-            "has_web_source": False
-        }
-    else:
-        result = resp["final_answer"]
-        trace_info = resp["trace"]
+            thinking_text = result.get("thinking_log", "无执行日志")
+            answer_text = result.get("final_answer", "")
+            report_content = result.get("report_content", "")
 
-    # 存入会话：问题、答案、trace完整过程
-    st.session_state.chat_history.append((user_query.strip(), result, trace_info))
+            status.update(label="✅ 执行完成", state="complete", expanded=False)
 
-    st.markdown("---")
-    st.subheader("📋Agent输出结果")
-    st.markdown(result)
+        st.markdown(answer_text)
+        if report_content:
+            st.download_button(
+                label="📥 下载生成报告(Markdown)",
+                data=report_content,
+                file_name="agent_generated_report.md",
+                mime="text/markdown"
+            )
 
-    # 下载Markdown报告按钮
-    st.download_button(
-        label="📥下载Markdown报告",
-        data=result,
-        file_name="mes_agent_report.md",
-        mime="text/markdown"
-    )
-
-    # 当前这一轮的工作过程展开面板
-    with st.expander("🔍查看Agent内部工作过程"):
-        st.markdown(f"**调度Agent分类：** {trace_info['route_type']}")
-        st.markdown("**检索素材片段：**")
-        for doc_text in trace_info["retrieve_docs"]:
-            st.code(doc_text, language="text")
-        st.markdown(f"**事实校验结果：** {trace_info['fact_check']}")
-        st.markdown(f"**是否使用联网搜索：** {trace_info['has_web_source']}")
-
-else:
-    st.info("输入业务问题，点击按钮运行Agent")
+    st.session_state.chat_history.append({
+        "role":"assistant",
+        "content": answer_text,
+        "thinking_log": thinking_text,
+        "report_md": report_content
+    })
+    st.rerun()
