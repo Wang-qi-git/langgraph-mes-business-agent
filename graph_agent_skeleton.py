@@ -1,3 +1,5 @@
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceBgeEmbeddings
 from typing import TypedDict, Annotated
 import operator
 from langgraph.graph import StateGraph, END
@@ -395,7 +397,7 @@ if __name__ == "__main__":
     print(app.get_graph().draw_mermaid())
     print("\n==== Running Agent ====\n")
     init_state: AgentState = {
-        "user_query": "帮我分析MES系统紧急插单会带来哪些风险",
+        "user_query": "分析MES可信报工与绩效数字化落地风险、关键流程以及管控方案，输出完整正式分析报告",
         "task_list": [],
         "current_task": None,
         "context_local_kb": "",
