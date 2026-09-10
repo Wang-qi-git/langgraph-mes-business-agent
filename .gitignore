@@ -1,10 +1,27 @@
-venv
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 虚拟环境
+venv/
+.venv/
+
+# 环境变量（绝对不能提交）
 .env
-.env
-__pycache__
-.pyc
-chroma_db
-.vscode
-.idea
-.log
-.pdf
+
+# 向量库（可重建，体积大）
+chroma_db/
+
+# 日志
+trace.jsonl
+trace.log
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# 系统文件
+.DS_Store
+Thumbs.db
