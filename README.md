@@ -30,30 +30,24 @@
 ## 二、系统架构
 
 ### 2.1 六节点工作流
-┌────────────────┐
-│ Planner Node │ ← 拆解用户问题为 2-4 个粗粒度任务
-└────────┬───────┘
-↓
-┌──────────────────────┐
-│ Tool Decide Node │ ← 三选一：chroma_search / tavily_search / no_tool
-└──────────┬───────────┘
-↓
-┌──────────────────────┐
-│ Tool Exec Node │ ← 执行工具，含 HITL 人工确认
-└──────────┬───────────┘
-↓
-┌──────────────────────┐
-│ Task Execute Node │ ← 基于素材完成子任务，含拒答检测
-└──────────┬───────────┘
-↓
-┌──────────────────────┐
-│ Reflect Node │ ← 反思质量，评估是否需继续循环
-└──────────┬───────────┘
-↓
-┌──────────────────────┐
-│ Summary Node │ ← 生成最终完整报告
-└──────────────────────┘
 
+```mermaid
+flowchart TD
+    A[Planner Node<br/>拆解用户问题为 2-4 个粗粒度任务] --> B[Tool Decide Node<br/>三选一: chroma_search / tavily_search / no_tool]
+    B --> C[Tool Exec Node<br/>执行工具, 含 HITL 人工确认]
+    C --> D[Task Execute Node<br/>基于素材完成子任务, 含拒答检测]
+    D --> E[Reflect Node<br/>反思质量, 评估是否需继续循环]
+    E -->|need_more_info = true| B
+    E -->|need_more_info = false| F[Summary Node<br/>生成最终完整报告]
+```
+
+**流程说明**：
+- **Planner** → 拆解问题
+- **Tool Decide** → 决定用哪个工具
+- **Tool Exec** → 执行工具（含 HITL 保护）
+- **Task Execute** → 完成子任务（含拒答检测）
+- **Reflect** → 评估是否需要继续循环（回到 Tool Decide）或直接出报告
+- **Summary** → 生成最终报告
 ### 2.2 核心状态（AgentState）
 
 | 字段 | 类型 | 说明 |
