@@ -1,7 +1,9 @@
+# 环境变量设置
 import os
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
+# 导入依赖
 from langchain_core.callbacks import BaseCallbackHandler
 import time
 import uuid
@@ -37,6 +39,7 @@ PRICE_IN = 0.0014
 PRICE_OUT = 0.0028
 AUTO_APPROVE_SEARCH = os.getenv("AUTO_APPROVE_SEARCH", "false").lower() == "true"
 
+# LLM 与工具初始化
 llm = ChatOpenAI(
     model="deepseek-chat",
     api_key=os.getenv("DEEPSEEK_API_KEY"),
@@ -106,7 +109,7 @@ def print_token_usage(resp):
         print("【Token统计】接口未返回usage信息")
         return 0, 0, 0
 
-
+# RAG 检索
 def chroma_search(query: str) -> tuple[str, list]:
     if not hasattr(chroma_search, "vector_db"):
         print("【懒加载】首次调用，加载BGE Embedding和Chroma向量库...")
@@ -136,14 +139,14 @@ def chroma_search(query: str) -> tuple[str, list]:
     source_list = list({doc.metadata.get("source_file", "未知文档") for doc in docs})
     return "\n\n".join(chunks), source_list
 
-
+# Trace 日志
 def write_trace_log(entry: dict):
     entry["timestamp"] = datetime.now().isoformat()
     line = json.dumps(entry, ensure_ascii=False) + "\n"
     with open("./trace.jsonl", "a", encoding="utf-8") as f:
         f.write(line)
 
-
+# 联网搜索
 def tavily_search(query: str, cache: dict) -> tuple[str | None, dict]:
     cache_key = query.strip()
     if cache_key in cache:
@@ -164,7 +167,7 @@ def tavily_search(query: str, cache: dict) -> tuple[str | None, dict]:
     return result, new_cache
 
 
-# ====================================================
+# ============AgentState 定义================
 class AgentState(TypedDict):
     user_query: str
     case_id: str
@@ -181,7 +184,7 @@ class AgentState(TypedDict):
     tavily_cache: dict
     ref_docs: list
 
-
+# ========== 5 个 Prompt 模板 ==========
 PLANNER_PROMPT = """
 拆分为2‑4个粗粒度任务，禁止细碎任务。输出纯JSON。
 
@@ -200,6 +203,7 @@ TOOL_DECIDE_PROMPT = """
 任务：{task_desc}
 已有本地知识库KB：{kb_ctx}
 已有Web：{web_ctx}
+
 工具三选一：chroma_search / tavily_search / no_tool。
 优先使用chroma_search查询本地知识库；本地无有效信息再选择tavily_search联网；已有信息足够就选no_tool，避免多余搜索。
 输出JSON：{"tool":"xxx","tool_query":"xxx"}
@@ -238,7 +242,7 @@ SUMMARY_PROMPT = """
 如果已有草稿可以直接复用、润色，不要完全重写。
 """
 
-
+# JSON 提取
 def extract_json(text: str):
     match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
     if match:
@@ -254,7 +258,7 @@ def extract_json(text: str):
         except json.JSONDecodeError:
             return None
 
-
+# planner_node 调用 LLM 拆解任务 - 解析 JSON - 返回任务列表
 def planner_node(state: AgentState):
     print("【planner_node】初始任务拆解")
     write_trace_log({
@@ -290,7 +294,7 @@ def planner_node(state: AgentState):
         "loop_count": 0
     }
 
-
+# tool_decide_node 取第一个 pending 任务 - 让 LLM 决定用哪个工具 - 把决策写入 current_task
 def tool_decide_node(state: AgentState):
     print("【tool_decide_node】工具决策")
     write_trace_log({
@@ -394,7 +398,7 @@ def tool_exec_node(state: AgentState):
         "ref_docs": new_ref
     }
 
-
+# 拒答短路
 def task_execute_node(state: AgentState):
     print("【task_execute_node】执行业务任务与校验")
     write_trace_log({
@@ -463,7 +467,7 @@ def task_execute_node(state: AgentState):
         "think_trace": think_trace
     }
 
-
+# reflect_node
 def reflect_node(state: AgentState):
     write_trace_log({
         "case_id": state["case_id"],
@@ -588,7 +592,7 @@ def reflect_node(state: AgentState):
         "loop_count": loop_cnt + 1
     }
 
-
+# 有草稿（Reflect 已经生成）- 只做润色，省 Token
 def summary_node(state: AgentState):
     write_trace_log({
         "case_id": state["case_id"],
@@ -637,7 +641,7 @@ def summary_node(state: AgentState):
     final_report = resp.content.strip() + ref_text
     return {"final_answer": final_report}
 
-
+# 路由与图构建
 def route_reflect(state: AgentState):
     if state["need_more_info"] is True:
         return "tool_decide_node"
@@ -662,6 +666,7 @@ builder.add_conditional_edges("reflect_node", route_reflect)
 builder.add_edge("summary_node", END)
 app = builder.compile()
 
+# 主入口
 if __name__ == "__main__":
     print("\n==== Graph Mermaid ====")
     print(app.get_graph().draw_mermaid())
