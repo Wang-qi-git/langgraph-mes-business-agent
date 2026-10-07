@@ -54,7 +54,7 @@ class AgentTraceHandler(BaseCallbackHandler):
     def __init__(self, trace_id):
         self.trace_id = trace_id
         self.start_time = {}
-        self.run_id_to_name = {} 
+        self.run_id_to_name = {}
 
     def _get_name(self, serialized, kwargs):
         if serialized and isinstance(serialized, dict):
@@ -109,6 +109,7 @@ def print_token_usage(resp):
         print("【Token统计】接口未返回usage信息")
         return 0, 0, 0
 
+
 # RAG 检索
 def chroma_search(query: str) -> tuple[str, list]:
     if not hasattr(chroma_search, "vector_db"):
@@ -139,12 +140,14 @@ def chroma_search(query: str) -> tuple[str, list]:
     source_list = list({doc.metadata.get("source_file", "未知文档") for doc in docs})
     return "\n\n".join(chunks), source_list
 
+
 # Trace 日志
 def write_trace_log(entry: dict):
     entry["timestamp"] = datetime.now().isoformat()
     line = json.dumps(entry, ensure_ascii=False) + "\n"
     with open("./trace.jsonl", "a", encoding="utf-8") as f:
         f.write(line)
+
 
 # 联网搜索
 def tavily_search(query: str, cache: dict) -> tuple[str | None, dict]:
@@ -171,6 +174,8 @@ def tavily_search(query: str, cache: dict) -> tuple[str | None, dict]:
 class AgentState(TypedDict):
     user_query: str
     case_id: str
+    user_id: str
+    user_role: str
     task_list: list[dict]
     current_task: dict | None
     context_local_kb: str
@@ -183,6 +188,29 @@ class AgentState(TypedDict):
     loop_count: int
     tavily_cache: dict
     ref_docs: list
+
+
+# ====================== 权限矩阵 ======================
+ROLE_PERMISSIONS = {
+    "operator":   ["chroma_search"],
+    "supervisor": ["chroma_search", "tavily_search"],
+    "admin":      ["chroma_search", "tavily_search"],
+}
+
+AUDIT_LOG_FILE = "./audit.log"
+
+
+def write_audit_log(entry: dict):
+    entry["timestamp"] = datetime.now().isoformat()
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
+    with open(AUDIT_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(line)
+
+
+def check_permission(user_role: str, tool_name: str) -> bool:
+    allowed = ROLE_PERMISSIONS.get(user_role, [])
+    return tool_name in allowed
+
 
 # ========== 5 个 Prompt 模板 ==========
 PLANNER_PROMPT = """
@@ -242,6 +270,7 @@ SUMMARY_PROMPT = """
 如果已有草稿可以直接复用、润色，不要完全重写。
 """
 
+
 # JSON 提取
 def extract_json(text: str):
     match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
@@ -258,7 +287,8 @@ def extract_json(text: str):
         except json.JSONDecodeError:
             return None
 
-# planner_node 调用 LLM 拆解任务 - 解析 JSON - 返回任务列表
+
+# planner_node
 def planner_node(state: AgentState):
     print("【planner_node】初始任务拆解")
     write_trace_log({
@@ -294,7 +324,8 @@ def planner_node(state: AgentState):
         "loop_count": 0
     }
 
-# tool_decide_node 取第一个 pending 任务 - 让 LLM 决定用哪个工具 - 把决策写入 current_task
+
+# tool_decide_node
 def tool_decide_node(state: AgentState):
     print("【tool_decide_node】工具决策")
     write_trace_log({
@@ -335,6 +366,7 @@ def tool_decide_node(state: AgentState):
     }
 
 
+# tool_exec_node
 def tool_exec_node(state: AgentState):
     print("【tool_exec_node】执行工具")
     write_trace_log({
@@ -346,6 +378,37 @@ def tool_exec_node(state: AgentState):
         think_trace = state["think_trace"][-TRACE_MAX_ITEMS:] + ["tool_exec：no_tool，跳过工具调用"]
         write_trace_log({"node": "tool_exec_node", "trace_info": "no_tool跳过调用"})
         return {"think_trace": think_trace}
+
+    # ========== 权限校验 ==========
+    user_role = state.get("user_role", "operator")
+    user_id = state.get("user_id", "anonymous")
+    tool_name = curr["tool_name"]
+
+    if not check_permission(user_role, tool_name):
+        denied_msg = f"【权限拒绝】用户 {user_id}（角色：{user_role}）无权调用工具 {tool_name}"
+        print(denied_msg)
+        write_trace_log({"node": "tool_exec_node", "action": "permission_denied", "tool": tool_name, "role": user_role})
+        write_audit_log({
+            "user_id": user_id,
+            "user_role": user_role,
+            "action": "permission_denied",
+            "tool": tool_name,
+            "query": state["user_query"],
+        })
+        task_list = [t.copy() for t in state["task_list"]]
+        for idx, t in enumerate(task_list):
+            if t["task_id"] == curr["task_id"]:
+                task_list[idx]["status"] = "completed"
+                task_list[idx]["task_output"] = denied_msg
+                break
+        think_trace = state["think_trace"][-TRACE_MAX_ITEMS:] + [denied_msg]
+        return {
+            "task_list": task_list,
+            "think_trace": think_trace,
+            "current_task": None,
+        }
+    # ========== 权限校验结束 ==========
+
     tool_q = curr.get("tool_query", "").strip()
     if not tool_q:
         skip_msg = f"tool_exec：task{curr['task_id']} tool_query为空，跳过工具调用"
@@ -398,7 +461,8 @@ def tool_exec_node(state: AgentState):
         "ref_docs": new_ref
     }
 
-# 拒答短路
+
+# task_execute_node
 def task_execute_node(state: AgentState):
     print("【task_execute_node】执行业务任务与校验")
     write_trace_log({
@@ -467,6 +531,7 @@ def task_execute_node(state: AgentState):
         "think_trace": think_trace
     }
 
+
 # reflect_node
 def reflect_node(state: AgentState):
     write_trace_log({
@@ -509,25 +574,6 @@ def reflect_node(state: AgentState):
             "think_trace": think_trace,
             "loop_count": loop_cnt + 1
         }
-
-    # 分支 C：提前收敛——循环≥2次且只剩1个 pending
-#     if loop_cnt >= 2 and len(pending) == 1:
-#         msg = f"reflect：循环{loop_cnt}次，剩余1个任务，提前收敛"
-#         print(msg)
-#         for idx, t in enumerate(task_list):
-#             if t["status"] == "pending":
-#                 task_list[idx]["status"] = "completed"
-#                 task_list[idx]["task_output"] = "【基于现有信息，该任务已完成初步分析】"
-#         think_trace = state["think_trace"][-TRACE_MAX_ITEMS:] + [msg]
-#         write_trace_log({"node": "reflect_node", "trace_info": msg})
-#         return {
-#             "task_list": task_list,
-#             "need_more_info": False,
-#             "final_answer": "",
-#             "think_trace": think_trace,
-#             "loop_count": loop_cnt + 1
-#         }
-
 
     # 分支 D：正常反思，调用 LLM 判断是否继续循环
     llm_payload = []
@@ -592,7 +638,8 @@ def reflect_node(state: AgentState):
         "loop_count": loop_cnt + 1
     }
 
-# 有草稿（Reflect 已经生成）- 只做润色，省 Token
+
+# summary_node
 def summary_node(state: AgentState):
     write_trace_log({
         "case_id": state["case_id"],
@@ -602,6 +649,8 @@ def summary_node(state: AgentState):
     ref_text = ""
     if ref_list:
         ref_text = "\n\n## 参考文档来源\n" + "\n".join([f"- {name}" for name in ref_list])
+
+    # ========== 分支 1：复用 reflect 草稿 ==========
     if state.get("final_answer") and len(state["final_answer"]) > SUMMARY_DRAFT_MIN_LEN:
         print("summary_node：复用reflect草稿，仅做润色")
         prompt = f"""已有草稿，润色整理成正式报告，不要完全重写。
@@ -618,9 +667,28 @@ def summary_node(state: AgentState):
             print(err_msg)
             write_trace_log({"level": "error", "node": "summary_node", "msg": err_msg})
             full_report = state["final_answer"] + ref_text + f"\n【润色异常:{str(e)}】"
+            write_audit_log({
+                "user_id": state.get("user_id", "anonymous"),
+                "user_role": state.get("user_role", "operator"),
+                "action": "query_completed",
+                "status": "summary_llm_error",
+                "query": state["user_query"],
+                "ref_docs": state.get("ref_docs", []),
+            })
             return {"final_answer": full_report}
-        full_report = resp.content.strip()
+
+        full_report = resp.content.strip() + ref_text
+        write_audit_log({
+            "user_id": state.get("user_id", "anonymous"),
+            "user_role": state.get("user_role", "operator"),
+            "action": "query_completed",
+            "status": "success",
+            "query": state["user_query"],
+            "ref_docs": state.get("ref_docs", []),
+        })
         return {"final_answer": full_report}
+
+    # ========== 分支 2：从子任务重新汇总 ==========
     blocks = []
     for t in state["task_list"]:
         out = t.get("task_output")
@@ -637,9 +705,27 @@ def summary_node(state: AgentState):
         print(err_msg)
         write_trace_log({"level": "error", "node": "summary_node", "msg": err_msg})
         full_report = f"【生成报告失败】{str(e)}" + ref_text
+        write_audit_log({
+            "user_id": state.get("user_id", "anonymous"),
+            "user_role": state.get("user_role", "operator"),
+            "action": "query_completed",
+            "status": "summary_llm_error",
+            "query": state["user_query"],
+            "ref_docs": state.get("ref_docs", []),
+        })
         return {"final_answer": full_report}
+
     final_report = resp.content.strip() + ref_text
+    write_audit_log({
+        "user_id": state.get("user_id", "anonymous"),
+        "user_role": state.get("user_role", "operator"),
+        "action": "query_completed",
+        "status": "success",
+        "query": state["user_query"],
+        "ref_docs": state.get("ref_docs", []),
+    })
     return {"final_answer": final_report}
+
 
 # 路由与图构建
 def route_reflect(state: AgentState):
@@ -666,6 +752,7 @@ builder.add_conditional_edges("reflect_node", route_reflect)
 builder.add_edge("summary_node", END)
 app = builder.compile()
 
+
 # 主入口
 if __name__ == "__main__":
     print("\n==== Graph Mermaid ====")
@@ -674,6 +761,8 @@ if __name__ == "__main__":
     init_state: AgentState = {
         "case_id": "local_debug",
         "user_query": "什么是MES系统中的工单管理",
+        "user_id": "local_user",
+        "user_role": "admin",
         "task_list": [],
         "current_task": None,
         "context_local_kb": "",

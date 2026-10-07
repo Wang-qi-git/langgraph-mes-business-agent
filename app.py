@@ -102,6 +102,17 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
+    st.divider()
+
+    # 用户角色选择
+    st.markdown("#### 👤 用户角色")
+    user_role = st.selectbox(
+        "选择角色",
+        ["operator", "supervisor", "admin"],
+        index=1,
+        help="operator：只能查本地知识库；supervisor/admin：可以联网"
+    )
+
     st.caption("GitHub: [Wang-qi-git/langgraph-mes-business-agent](https://github.com/Wang-qi-git/langgraph-mes-business-agent)")
 
 
@@ -175,6 +186,8 @@ if user_input:
             init_state: AgentState = {
                 "case_id": f"web_{int(time.time())}",
                 "user_query": user_input,
+                "user_id": "web_user",
+                "user_role": user_role,
                 "task_list": [],
                 "current_task": None,
                 "context_local_kb": "",
