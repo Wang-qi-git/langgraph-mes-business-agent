@@ -55,6 +55,19 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+# ==================== 辅助函数：判断是否需要上下文 ====================
+def needs_context(query: str) -> bool:
+    """判断问题是否需要上下文（指代词/追问词）"""
+    pronouns = ["它", "他", "她", "这个", "那个", "这些", "那些", "该", "此", "上述", "刚才", "之前"]
+    followup = ["详细说说", "展开", "继续", "还有呢", "然后呢", "举个例子", "再说说"]
+
+    if len(query) < 20 and any(p in query for p in pronouns):
+        return True
+    if len(query) < 15 and any(f in query for f in followup):
+        return True
+    return False
+
+
 # ==================== 侧边栏 ====================
 with st.sidebar:
     st.markdown("### 🏭 MES 业务分析 Agent")
@@ -67,6 +80,7 @@ with st.sidebar:
     - 六节点工作流编排
     - RAG 知识库检索
     - 双层拒答机制
+    - 多轮对话支持
     - Eval 评估体系
     - 多层安全兜底
     """)
@@ -118,7 +132,7 @@ with st.sidebar:
 
 # ==================== 主区域 ====================
 st.markdown('<div class="main-title">🏭 MES 业务分析 Agent</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">输入制造业 MES 相关问题，Agent 自动检索知识库并输出结构化分析报告</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">输入制造业 MES 相关问题，Agent 自动检索知识库并输出结构化分析报告（支持多轮追问）</div>', unsafe_allow_html=True)
 
 
 # ==================== 初始化会话状态 ====================
@@ -175,9 +189,24 @@ if user_input:
     with st.chat_message("user", avatar="🧑"):
         st.markdown(user_input)
 
-    # 2. 调用 Agent
+    # 2. 判断是否需要拼接历史
+    if needs_context(user_input) and len(st.session_state.messages) > 1:
+        # 只取最近 2 轮对话（不含当前问题）
+        recent = st.session_state.messages[-4:-1]
+        history_text = "\n".join([
+            f"{'用户' if m['role'] == 'user' else '助手'}: {m['content'][:150]}"
+            for m in recent
+        ])
+        history_text = history_text[:300]  # 硬上限 300 字
+        full_query = f"【上文】\n{history_text}\n\n【当前】\n{user_input}"
+    else:
+        full_query = user_input
+
+    # 3. 调用 Agent
     with st.chat_message("assistant", avatar="🤖"):
         with st.status("🤖 Agent 运行中...", expanded=True) as status:
+            if full_query != user_input:
+                st.write("💡 检测到追问，已携带上下文")
             st.write("📋 Planner 正在拆解任务...")
 
             start_time = time.time()
@@ -185,7 +214,7 @@ if user_input:
             # 构建初始状态
             init_state: AgentState = {
                 "case_id": f"web_{int(time.time())}",
-                "user_query": user_input,
+                "user_query": full_query,
                 "user_id": "web_user",
                 "user_role": user_role,
                 "task_list": [],
