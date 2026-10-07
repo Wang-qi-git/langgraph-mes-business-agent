@@ -9,6 +9,7 @@ import time
 import uuid
 import json
 import re
+import hashlib
 import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
@@ -18,6 +19,7 @@ from typing import TypedDict
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from tavily import TavilyClient
+from cachetools import LRUCache
 import mes_tools
 
 # 加载 .env 环境变量
@@ -39,6 +41,13 @@ CHROMA_TOP_K = 3
 PRICE_IN = 0.0014
 PRICE_OUT = 0.0028
 AUTO_APPROVE_SEARCH = os.getenv("AUTO_APPROVE_SEARCH", "false").lower() == "true"
+
+# 日志轮转配置
+LOG_MAX_MB = 10        # 单个日志文件最大 10MB
+LOG_BACKUPS = 3        # 保留 3 个备份
+
+# 答案缓存配置
+CACHE_MAX_SIZE = 500   # 最多缓存 500 条答案
 
 # LLM 与工具初始化
 llm = ChatOpenAI(
@@ -88,6 +97,58 @@ class AgentTraceHandler(BaseCallbackHandler):
         print(f"[TRACE:{self.trace_id}] 【发起LLM调用】")
 
 
+# ====================== 日志轮转 ======================
+def _rotate_if_needed(path: str, max_mb: int = LOG_MAX_MB, backups: int = LOG_BACKUPS):
+    """日志文件超过 max_mb 时轮转：path -> path.1 -> path.2 -> ... -> path.N"""
+    if not os.path.exists(path):
+        return
+    if os.path.getsize(path) / (1024 * 1024) < max_mb:
+        return
+    # 删除最旧的备份
+    oldest = f"{path}.{backups}"
+    if os.path.exists(oldest):
+        try:
+            os.remove(oldest)
+        except Exception:
+            pass
+    # 逐个重命名：path.N-1 -> path.N
+    for i in range(backups - 1, 0, -1):
+        src = f"{path}.{i}"
+        dst = f"{path}.{i+1}"
+        if os.path.exists(src):
+            try:
+                os.rename(src, dst)
+            except Exception:
+                pass
+    # path -> path.1
+    try:
+        os.rename(path, f"{path}.1")
+        print(f"【日志轮转】{path} -> {path}.1（超过 {max_mb}MB）")
+    except Exception as e:
+        print(f"【日志轮转失败】{path}: {e}")
+
+
+# ====================== 答案缓存 ======================
+_ANSWER_CACHE = LRUCache(maxsize=CACHE_MAX_SIZE)
+
+
+def _cache_key(query: str, user_role: str) -> str:
+    """缓存 key：user_role + query 的 MD5。角色不同不共享缓存（权限不同）"""
+    return hashlib.md5(f"{user_role}::{query.strip()}".encode("utf-8")).hexdigest()
+
+
+def _cache_get(query: str, user_role: str):
+    return _ANSWER_CACHE.get(_cache_key(query, user_role))
+
+
+def _cache_set(query: str, user_role: str, answer: str):
+    _ANSWER_CACHE[_cache_key(query, user_role)] = answer
+
+
+def _cache_stats() -> dict:
+    return {"size": len(_ANSWER_CACHE), "maxsize": _ANSWER_CACHE.maxsize}
+
+
 # ========== Token统计辅助函数 ==========
 def print_token_usage(resp):
     if hasattr(resp, "usage_metadata") and resp.usage_metadata:
@@ -114,6 +175,7 @@ def print_token_usage(resp):
 # ========== 模型缓存（模块级全局） ==========
 _GLOBAL_VECTOR_DB = None
 _GLOBAL_RERANKER = None
+_RERANKER_FAILED = False    # Reranker 加载失败的永久标记
 
 
 def _get_vector_db():
@@ -133,22 +195,34 @@ def _get_vector_db():
 
 
 def get_reranker():
-    global _GLOBAL_RERANKER
+    """Reranker 加载（带失败降级）
+    - 加载失败后永久标记 _RERANKER_FAILED=True，避免反复尝试拖慢请求
+    - 返回 None 表示不可用，调用方需降级
+    """
+    global _GLOBAL_RERANKER, _RERANKER_FAILED
+    if _RERANKER_FAILED:
+        return None
     if _GLOBAL_RERANKER is None:
-        print("【懒加载】加载 Reranker 模型 bge-reranker-v2-m3...")
-        from FlagEmbedding import FlagReranker
-        _GLOBAL_RERANKER = FlagReranker(
-            './models/bge-reranker-v2-m3',
-            use_fp16=False
-        )
-        print("【懒加载】Reranker 加载完成")
+        try:
+            print("【懒加载】加载 Reranker 模型 bge-reranker-v2-m3...")
+            from FlagEmbedding import FlagReranker
+            _GLOBAL_RERANKER = FlagReranker(
+                './models/bge-reranker-v2-m3',
+                use_fp16=False
+            )
+            print("【懒加载】Reranker 加载完成")
+        except Exception as e:
+            print(f"【Reranker 加载失败】降级为向量 Top-K 模式：{e}")
+            _RERANKER_FAILED = True
+            return None
     return _GLOBAL_RERANKER
 
 
-# RAG 检索（粗召回 + Rerank 精排）
+# RAG 检索（粗召回 + Rerank 精排，带完整降级）
 def chroma_search(query: str) -> tuple[str, list]:
     vector_db = _get_vector_db()
 
+    # ========== 第一步：粗召回 ==========
     try:
         docs = vector_db.similarity_search(query, k=10)
     except Exception as e:
@@ -160,26 +234,42 @@ def chroma_search(query: str) -> tuple[str, list]:
     if not docs:
         return "", []
 
-    try:
-        reranker = get_reranker()
-        pairs = [[query, doc.page_content] for doc in docs]
-        scores = reranker.compute_score(pairs)
-        ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
-        top_docs = [doc for _, doc in ranked[:CHROMA_TOP_K]]
+    # ========== 第二步：Rerank 精排（三级降级） ==========
+    top_docs = None
+    reranker = get_reranker()
+
+    if reranker is not None:
+        # 一级：正常 Rerank
+        try:
+            pairs = [[query, doc.page_content] for doc in docs]
+            scores = reranker.compute_score(pairs)
+            ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+            top_docs = [doc for _, doc in ranked[:CHROMA_TOP_K]]
+            write_trace_log({
+                "func": "rerank",
+                "query": query,
+                "before": len(docs),
+                "after": len(top_docs),
+                "top_scores": [round(float(s), 3) for s, _ in ranked[:3]]
+            })
+            print(f"【Rerank】精排完成，{len(docs)} -> {len(top_docs)}")
+        except Exception as e:
+            # 二级：Rerank 推理异常，降级到向量 Top-K
+            print(f"【Rerank 推理异常】降级为向量 Top-{CHROMA_TOP_K}：{e}")
+            write_trace_log({
+                "level": "error",
+                "func": "rerank",
+                "msg": f"Rerank推理失败，降级到向量Top{CHROMA_TOP_K}",
+                "error": str(e)
+            })
+            top_docs = docs[:CHROMA_TOP_K]
+    else:
+        # 三级：Reranker 完全不可用，直接向量 Top-K
+        print(f"【Rerank 降级】Reranker 不可用，使用向量 Top-{CHROMA_TOP_K}")
         write_trace_log({
+            "level": "warning",
             "func": "rerank",
-            "query": query,
-            "before": len(docs),
-            "after": len(top_docs),
-            "top_scores": [round(float(s), 3) for s, _ in ranked[:3]]
-        })
-    except Exception as e:
-        print(f"【Rerank 降级】{str(e)}，使用原始 Top {CHROMA_TOP_K}")
-        write_trace_log({
-            "level": "error",
-            "func": "rerank",
-            "msg": f"Rerank失败，降级到原始Top{CHROMA_TOP_K}",
-            "error": str(e)
+            "msg": f"Reranker不可用，降级为向量Top{CHROMA_TOP_K}"
         })
         top_docs = docs[:CHROMA_TOP_K]
 
@@ -192,6 +282,7 @@ def chroma_search(query: str) -> tuple[str, list]:
 
 
 def write_trace_log(entry: dict):
+    _rotate_if_needed("./trace.jsonl")
     entry["timestamp"] = datetime.now().isoformat()
     line = json.dumps(entry, ensure_ascii=False) + "\n"
     with open("./trace.jsonl", "a", encoding="utf-8") as f:
@@ -322,6 +413,7 @@ AUDIT_LOG_FILE = "./audit.log"
 
 
 def write_audit_log(entry: dict):
+    _rotate_if_needed(AUDIT_LOG_FILE)
     entry["timestamp"] = datetime.now().isoformat()
     line = json.dumps(entry, ensure_ascii=False) + "\n"
     with open(AUDIT_LOG_FILE, "a", encoding="utf-8") as f:
@@ -622,7 +714,7 @@ def tool_exec_node(state: AgentState):
                     print(skip_msg)
                     think_trace = state["think_trace"][-TRACE_MAX_ITEMS:] + [skip_msg]
                     write_trace_log({"node": "tool_exec_node", "trace_info": skip_msg})
-                    return {"think_trace": think_trace}
+                    return {"think_trace": skip_msg}
                 mes_result = mes_func(tool_q)
 
             print(f"【MES 工具】{curr['tool_name']} 返回：{mes_result[:200]}...")
@@ -638,6 +730,8 @@ def tool_exec_node(state: AgentState):
         except Exception as e:
             err_msg = f"【MES 工具异常】{curr['tool_name']}: {str(e)}"
             print(err_msg)
+            # 降级：给 LLM 一个提示，避免编造
+            new_local_kb += f"\n【MES 系统暂时不可用】{curr['tool_name']} 查询失败，请基于现有信息回答，不要编造实时数据。"
             obs_list.append(err_msg)
             write_trace_log({"level": "error", "node": "tool_exec_node", "msg": err_msg})
 
@@ -648,7 +742,7 @@ def tool_exec_node(state: AgentState):
             print(skip_msg)
             think_trace = state["think_trace"][-TRACE_MAX_ITEMS:] + [skip_msg]
             write_trace_log({"node": "tool_exec_node", "trace_info": skip_msg})
-            return {"think_trace": think_trace}
+            return {"think_trace": skip_msg}
 
         if AUTO_APPROVE_SEARCH:
             user_input = "y"
@@ -996,6 +1090,8 @@ def _warmup_models():
         _t0 = _time.time()
 
         _ = _get_vector_db()
+
+        # Reranker 可能失败，不阻塞主流程
         _ = get_reranker()
 
         print("【模块预热】执行一次真实检索（消除首次调用开销）...")
@@ -1065,7 +1161,7 @@ async def stream_agent(user_query: str, case_id: str = "stream", user_role: str 
                 yield chunk.content
 
 
-# ---------- 快速模式（RAG + 单次 LLM） ----------
+# ---------- 快速模式（RAG + 单次 LLM，带缓存） ----------
 QUICK_PROMPT = """你是制造业MES业务专家。基于下面的参考资料回答用户问题。
 
 【硬性要求】
@@ -1083,7 +1179,14 @@ QUICK_PROMPT = """你是制造业MES业务专家。基于下面的参考资料�
 
 
 def quick_answer(user_query: str, user_role: str = "admin") -> str:
-    """快速模式（非流式）：RAG + 单次 LLM，同步返回完整答案。"""
+    """快速模式（非流式）：RAG + 单次 LLM，同步返回完整答案。带缓存。"""
+    # 1. 尝试命中缓存
+    cached = _cache_get(user_query, user_role)
+    if cached is not None:
+        print(f"【缓存命中】{user_query[:30]}...")
+        return cached
+
+    # 2. 未命中：走完整流程
     try:
         kb_ctx, _ = chroma_search(user_query)
     except Exception as e:
@@ -1095,11 +1198,22 @@ def quick_answer(user_query: str, user_role: str = "admin") -> str:
 
     prompt = QUICK_PROMPT.replace("{kb_ctx}", kb_ctx[:800]).replace("{user_query}", user_query)
     resp = llm.invoke(prompt)
+
+    # 3. 写入缓存
+    _cache_set(user_query, user_role, resp.content)
     return resp.content
 
 
 def quick_answer_stream(user_query: str, user_role: str = "admin"):
-    """快速模式（流式）：RAG + 单次 LLM，同步流式 yield token。"""
+    """快速模式（流式）：RAG + 单次 LLM，同步流式 yield token。带缓存。"""
+    # 1. 尝试命中缓存
+    cached = _cache_get(user_query, user_role)
+    if cached is not None:
+        print(f"【缓存命中-流式】{user_query[:30]}...")
+        yield cached
+        return
+
+    # 2. 未命中：走完整流程
     try:
         kb_ctx, _ = chroma_search(user_query)
     except Exception as e:
@@ -1110,10 +1224,24 @@ def quick_answer_stream(user_query: str, user_role: str = "admin"):
         kb_ctx = "（无参考资料，基于你的领域知识回答）"
 
     prompt = QUICK_PROMPT.replace("{kb_ctx}", kb_ctx[:800]).replace("{user_query}", user_query)
+
+    # 3. 流式输出，同时累积答案
+    full_answer = ""
     for chunk in llm.stream(prompt):
         if hasattr(chunk, "content") and chunk.content:
+            full_answer += chunk.content
             yield chunk.content
+
+    # 4. 流式结束写入缓存
+    if full_answer:
+        _cache_set(user_query, user_role, full_answer)
 # ========== 流式输出辅助函数结束 ==========
+
+
+# ====================== 缓存统计入口 ======================
+def get_cache_stats() -> dict:
+    """查看缓存状态（供 API/CLI 调用）"""
+    return _cache_stats()
 
 
 # 主入口
