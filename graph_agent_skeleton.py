@@ -9,6 +9,7 @@ import time
 import uuid
 import json
 import re
+import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
 from langchain_chroma import Chroma
@@ -20,7 +21,6 @@ from tavily import TavilyClient
 
 # 加载 .env 环境变量
 load_dotenv()
-# 开启LangSmith全链路追踪
 os.environ["LANGSMITH_TRACING"] = "true"
 os.environ["LANGSMITH_ENDPOINT"] = "https://api.smith.langchain.com"
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
@@ -110,38 +110,86 @@ def print_token_usage(resp):
         return 0, 0, 0
 
 
-# RAG 检索
-def chroma_search(query: str) -> tuple[str, list]:
-    if not hasattr(chroma_search, "vector_db"):
+# ========== 模型缓存（模块级全局） ==========
+_GLOBAL_VECTOR_DB = None
+_GLOBAL_RERANKER = None
+
+
+def _get_vector_db():
+    global _GLOBAL_VECTOR_DB
+    if _GLOBAL_VECTOR_DB is None:
         print("【懒加载】首次调用，加载BGE Embedding和Chroma向量库...")
-        model_name = "BAAI/bge-small-zh-v1.5"
-        model_kwargs = {"device": "cpu"}
-        encode_kwargs = {"normalize_embeddings": True}
         embedding = HuggingFaceEmbeddings(
-            model_name=model_name,
-            model_kwargs=model_kwargs,
-            encode_kwargs=encode_kwargs
+            model_name="BAAI/bge-small-zh-v1.5",
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True}
         )
-        chroma_search.vector_db = Chroma(
+        _GLOBAL_VECTOR_DB = Chroma(
             persist_directory=CHROMA_PERSIST_DIR,
             embedding_function=embedding
         )
-    vector_db = chroma_search.vector_db
+    return _GLOBAL_VECTOR_DB
+
+
+def get_reranker():
+    global _GLOBAL_RERANKER
+    if _GLOBAL_RERANKER is None:
+        print("【懒加载】加载 Reranker 模型 bge-reranker-v2-m3...")
+        from FlagEmbedding import FlagReranker
+        _GLOBAL_RERANKER = FlagReranker(
+            './models/bge-reranker-v2-m3',
+            use_fp16=False
+        )
+        print("【懒加载】Reranker 加载完成")
+    return _GLOBAL_RERANKER
+
+
+# RAG 检索（粗召回 + Rerank 精排）
+def chroma_search(query: str) -> tuple[str, list]:
+    vector_db = _get_vector_db()
+
     try:
-        docs = vector_db.similarity_search(query, k=CHROMA_TOP_K)
+        docs = vector_db.similarity_search(query, k=10)
     except Exception as e:
         err_msg = f"Chroma检索异常:{str(e)}"
         print(err_msg)
         write_trace_log({"level": "error", "func": "chroma_search", "msg": err_msg})
         return "", []
+
     if not docs:
         return "", []
-    chunks = [doc.page_content for doc in docs]
-    source_list = list({doc.metadata.get("source_file", "未知文档") for doc in docs})
+
+    try:
+        reranker = get_reranker()
+        pairs = [[query, doc.page_content] for doc in docs]
+        scores = reranker.compute_score(pairs)
+        ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+        top_docs = [doc for _, doc in ranked[:CHROMA_TOP_K]]
+        write_trace_log({
+            "func": "rerank",
+            "query": query,
+            "before": len(docs),
+            "after": len(top_docs),
+            "top_scores": [round(float(s), 3) for s, _ in ranked[:3]]
+        })
+    except Exception as e:
+        print(f"【Rerank 降级】{str(e)}，使用原始 Top {CHROMA_TOP_K}")
+        write_trace_log({
+            "level": "error",
+            "func": "rerank",
+            "msg": f"Rerank失败，降级到原始Top{CHROMA_TOP_K}",
+            "error": str(e)
+        })
+        top_docs = docs[:CHROMA_TOP_K]
+
+    chunks = [doc.page_content for doc in top_docs]
+    source_list = list({
+        doc.metadata.get("source_file", "未知文档")
+        for doc in top_docs
+    })
     return "\n\n".join(chunks), source_list
 
 
-# Trace 日志
 def write_trace_log(entry: dict):
     entry["timestamp"] = datetime.now().isoformat()
     line = json.dumps(entry, ensure_ascii=False) + "\n"
@@ -149,7 +197,67 @@ def write_trace_log(entry: dict):
         f.write(line)
 
 
-# 联网搜索
+# ====================== BOM 版本前置守卫 ======================
+_available_versions_cache = None
+
+def get_available_versions() -> set:
+    global _available_versions_cache
+    if _available_versions_cache is not None:
+        return _available_versions_cache
+
+    versions = set()
+    pattern = re.compile(r'(?:BOM\s*)?版本\s*[:：]?\s*[vV]?(\d+(?:\.\d+)?)')
+    docs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "md_docs")
+
+    if os.path.isdir(docs_dir):
+        for fn in os.listdir(docs_dir):
+            if fn.endswith(".md"):
+                try:
+                    with open(os.path.join(docs_dir, fn), "r", encoding="utf-8") as f:
+                        content = f.read()
+                    for m in pattern.findall(content):
+                        versions.add(f"V{m}")
+                except Exception as e:
+                    print(f"【版本索引】读取 {fn} 失败: {e}")
+
+    _available_versions_cache = versions
+    print(f"【版本索引】已加载可用版本：{sorted(versions)}")
+    return versions
+
+
+def _normalize_version(v: str) -> str:
+    v = v.upper().lstrip("V")
+    if "." not in v:
+        v = v + ".0"
+    return v
+
+
+def check_bom_version_guard(tool_query: str, user_query: str = "") -> str | None:
+    available = get_available_versions()
+    if not available:
+        return None
+
+    available_norm = {_normalize_version(v) for v in available}
+    bom_pattern = re.compile(
+        r'BOM\s*(?:版本|version)?\s*[:：]?\s*[vV]?(\d+(?:\.\d+)?)',
+        re.IGNORECASE
+    )
+
+    for q in (tool_query, user_query):
+        if not q:
+            continue
+        for m in bom_pattern.finditer(q):
+            target = f"V{m.group(1)}"
+            if _normalize_version(target) not in available_norm:
+                available_display = "、".join(sorted(available))
+                return (
+                    f"【系统前置拦截】查询中提及的 BOM 版本 {target} 不存在。"
+                    f"当前知识库中可用的 BOM 版本为：{available_display}。"
+                    f"请确认版本号是否正确，不要基于其他版本信息推测该版本内容。"
+                )
+    return None
+
+
 def tavily_search(query: str, cache: dict) -> tuple[str | None, dict]:
     cache_key = query.strip()
     if cache_key in cache:
@@ -249,13 +357,29 @@ REFLECT_REPLAN_PROMPT = """
 任务列表：{task_list_payload}
 KB片段：{kb_snippet}
 Web片段：{web_snippet}
-规则：
-1.任务保持粗粒度，status仅pending/completed。
-2.质量校验：completed任务输出幻觉/信息不足则改为pending重跑；合格保留completed。
-3.返回JSON禁止携带大段task_output。
-4.有pending任务：need_more_info=true，final_answer=""。
-5.全部completed且校验通过：need_more_info=false，输出final_answer草稿。
-仅输出JSON：
+
+【收敛优先原则（最高优先级）】
+只要所有任务的输出能基本回答用户问题，立即收敛，need_more_info=false。
+以下情况不算"信息不足"，禁止继续循环：
+- "可以更详细"
+- "可以更结构化"
+- "可以补充更多细节"
+- "可以引用更多文档"
+- "理论上可以更完美"
+
+只有以下情况才允许把任务改回 pending：
+- 输出明显答非所问（比如问 OEE 答成 SPC）
+- 输出大量编造内容，与知识库冲突
+- 任务状态是 completed 但 task_output 为空
+
+【规则】
+1. 任务保持粗粒度，status 仅 pending / completed。
+2. 所有任务已 completed 且有非空输出，默认 need_more_info=false。
+3. 返回 JSON 禁止携带大段 task_output。
+4. 有明确 pending 任务：need_more_info=true，final_answer=""。
+5. 全部 completed 且校验通过：need_more_info=false，输出 final_answer 草稿。
+
+仅输出 JSON：
 {
   "task_list": [{"task_id":int,"desc":"str","status":"pending|completed"}],
   "need_more_info": true|false,
@@ -271,7 +395,6 @@ SUMMARY_PROMPT = """
 """
 
 
-# JSON 提取
 def extract_json(text: str):
     match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
     if match:
@@ -288,7 +411,6 @@ def extract_json(text: str):
             return None
 
 
-# planner_node
 def planner_node(state: AgentState):
     print("【planner_node】初始任务拆解")
     write_trace_log({
@@ -325,7 +447,6 @@ def planner_node(state: AgentState):
     }
 
 
-# tool_decide_node
 def tool_decide_node(state: AgentState):
     print("【tool_decide_node】工具决策")
     write_trace_log({
@@ -366,7 +487,6 @@ def tool_decide_node(state: AgentState):
     }
 
 
-# tool_exec_node
 def tool_exec_node(state: AgentState):
     print("【tool_exec_node】执行工具")
     write_trace_log({
@@ -379,7 +499,6 @@ def tool_exec_node(state: AgentState):
         write_trace_log({"node": "tool_exec_node", "trace_info": "no_tool跳过调用"})
         return {"think_trace": think_trace}
 
-    # ========== 权限校验 ==========
     user_role = state.get("user_role", "operator")
     user_id = state.get("user_id", "anonymous")
     tool_name = curr["tool_name"]
@@ -407,7 +526,6 @@ def tool_exec_node(state: AgentState):
             "think_trace": think_trace,
             "current_task": None,
         }
-    # ========== 权限校验结束 ==========
 
     tool_q = curr.get("tool_query", "").strip()
     if not tool_q:
@@ -422,12 +540,25 @@ def tool_exec_node(state: AgentState):
     tavily_cache = state["tavily_cache"].copy()
     new_ref = state.get("ref_docs", []).copy()
     if curr["tool_name"] == "chroma_search":
-        res, sources = chroma_search(tool_q)
-        if res:
-            new_local_kb += "\n" + res
+        block_message = check_bom_version_guard(tool_q, state.get("user_query", ""))
+        if block_message:
+            print(f"【前置拦截】{block_message}")
+            write_trace_log({
+                "node": "tool_exec_node",
+                "action": "bom_version_blocked",
+                "tool_query": tool_q,
+                "msg": block_message
+            })
+            new_local_kb += "\n" + block_message
             new_local_kb = new_local_kb[-CONTEXT_MAX_LEN:]
-            new_ref = list(set(new_ref + sources))
-        obs_list.append(f"chroma_search 返回:{res[:200]}... 来源:{sources}")
+            obs_list.append(f"chroma_search 被前置拦截:{block_message}")
+        else:
+            res, sources = chroma_search(tool_q)
+            if res:
+                new_local_kb += "\n" + res
+                new_local_kb = new_local_kb[-CONTEXT_MAX_LEN:]
+                new_ref = list(set(new_ref + sources))
+            obs_list.append(f"chroma_search 返回:{res[:200]}... 来源:{sources}")
     elif curr["tool_name"] == "tavily_search":
         if AUTO_APPROVE_SEARCH:
             user_input = "y"
@@ -462,7 +593,6 @@ def tool_exec_node(state: AgentState):
     }
 
 
-# task_execute_node
 def task_execute_node(state: AgentState):
     print("【task_execute_node】执行业务任务与校验")
     write_trace_log({
@@ -476,7 +606,6 @@ def task_execute_node(state: AgentState):
         write_trace_log({"node": "task_execute_node", "trace_info": "无当前任务"})
         return {"think_trace": think_trace}
 
-    # ========== 拒答检测 ==========
     if curr["desc"].startswith("REJECT:"):
         reject_msg = (
             "抱歉，我是MES业务助手，专注于制造业生产管理相关问题"
@@ -501,7 +630,6 @@ def task_execute_node(state: AgentState):
             "current_task": None,
             "think_trace": think_trace
         }
-    # ========== 拒答检测结束 ==========
 
     prompt = TASK_EXECUTE_PROMPT.replace("{task_desc}", curr["desc"])
     prompt = prompt.replace("{kb_ctx}", state["context_local_kb"])
@@ -532,7 +660,6 @@ def task_execute_node(state: AgentState):
     }
 
 
-# reflect_node
 def reflect_node(state: AgentState):
     write_trace_log({
         "case_id": state["case_id"],
@@ -544,7 +671,6 @@ def reflect_node(state: AgentState):
     task_list = [t.copy() for t in state["task_list"]]
     pending = [t for t in task_list if t["status"] == "pending"]
 
-    # 分支 A：达到最大循环，所有任务完成
     if loop_cnt >= MAX_LOOP and len(pending) == 0:
         msg = f"reflect：达到最大循环{MAX_LOOP}次，全部任务完成"
         print(msg)
@@ -557,7 +683,6 @@ def reflect_node(state: AgentState):
             "loop_count": loop_cnt + 1
         }
 
-    # 分支 B：达到最大循环，仍有 pending，强制结束
     if loop_cnt >= MAX_LOOP and len(pending) > 0:
         warn_msg = f"reflect警告：达到最大循环{MAX_LOOP}次，仍存在未完成任务，强制结束"
         print(warn_msg)
@@ -575,7 +700,25 @@ def reflect_node(state: AgentState):
             "loop_count": loop_cnt + 1
         }
 
-    # 分支 D：正常反思，调用 LLM 判断是否继续循环
+    # 分支 C：快速收敛保护
+    if loop_cnt >= 0:
+        all_done = all(
+            t["status"] == "completed" and t.get("task_output", "").strip()
+            for t in task_list
+        )
+        if all_done:
+            msg = f"reflect：快速收敛保护触发（loop={loop_cnt}，全部任务已完成且有输出）"
+            print(msg)
+            write_trace_log({"node": "reflect_node", "trace_info": msg})
+            think_trace = state["think_trace"][-TRACE_MAX_ITEMS:] + [msg]
+            return {
+                "task_list": task_list,
+                "need_more_info": False,
+                "final_answer": "",
+                "think_trace": think_trace,
+                "loop_count": loop_cnt + 1
+            }
+
     llm_payload = []
     for t in task_list:
         item = {"task_id": t["task_id"], "desc": t["desc"], "status": t["status"]}
@@ -639,7 +782,6 @@ def reflect_node(state: AgentState):
     }
 
 
-# summary_node
 def summary_node(state: AgentState):
     write_trace_log({
         "case_id": state["case_id"],
@@ -650,7 +792,6 @@ def summary_node(state: AgentState):
     if ref_list:
         ref_text = "\n\n## 参考文档来源\n" + "\n".join([f"- {name}" for name in ref_list])
 
-    # ========== 分支 1：复用 reflect 草稿 ==========
     if state.get("final_answer") and len(state["final_answer"]) > SUMMARY_DRAFT_MIN_LEN:
         print("summary_node：复用reflect草稿，仅做润色")
         prompt = f"""已有草稿，润色整理成正式报告，不要完全重写。
@@ -677,7 +818,7 @@ def summary_node(state: AgentState):
             })
             return {"final_answer": full_report}
 
-        full_report = resp.content.strip() + ref_text
+        full_report = resp.content.strip()
         write_audit_log({
             "user_id": state.get("user_id", "anonymous"),
             "user_role": state.get("user_role", "operator"),
@@ -688,7 +829,6 @@ def summary_node(state: AgentState):
         })
         return {"final_answer": full_report}
 
-    # ========== 分支 2：从子任务重新汇总 ==========
     blocks = []
     for t in state["task_list"]:
         out = t.get("task_output")
@@ -715,7 +855,7 @@ def summary_node(state: AgentState):
         })
         return {"final_answer": full_report}
 
-    final_report = resp.content.strip() + ref_text
+    final_report = resp.content.strip()
     write_audit_log({
         "user_id": state.get("user_id", "anonymous"),
         "user_role": state.get("user_role", "operator"),
@@ -727,7 +867,6 @@ def summary_node(state: AgentState):
     return {"final_answer": final_report}
 
 
-# 路由与图构建
 def route_reflect(state: AgentState):
     if state["need_more_info"] is True:
         return "tool_decide_node"
@@ -753,6 +892,154 @@ builder.add_edge("summary_node", END)
 app = builder.compile()
 
 
+# ========== 模块级模型预热 ==========
+_global_warmup_done = False
+
+def _warmup_models():
+    """加载模型 + 真跑一次检索，消除所有首次调用开销"""
+    global _global_warmup_done
+    if _global_warmup_done:
+        return
+    try:
+        import time as _time
+        print("【模块预热】开始加载 Embedding + Reranker 模型...")
+        _t0 = _time.time()
+
+        _ = _get_vector_db()
+        _ = get_reranker()
+
+        print("【模块预热】执行一次真实检索（消除首次调用开销）...")
+        _ = chroma_search("预热查询")
+        print("【模块预热】真实检索完成")
+
+        _global_warmup_done = True
+        print(f"【模块预热】完成，耗时 {_time.time() - _t0:.2f}s")
+    except Exception as e:
+        print(f"【模块预热】失败（不影响主流程）：{e}")
+
+_warmup_models()
+# ========== 模块预热结束 ==========
+
+
+# ========== 流式输出辅助函数 ==========
+NODE_LABELS = {
+    "planner_node":       "正在拆解问题...",
+    "tool_decide_node":   "正在选择工具...",
+    "tool_exec_node":     "正在检索知识库...",
+    "task_execute_node":  "正在生成子答案...",
+    "reflect_node":       "正在反思校验...",
+    "summary_node":       "正在整理最终答案...",
+}
+
+PROGRESS_PREFIX = "[PROGRESS]"
+
+
+# ---------- 深度模式（六节点工作流，异步流式） ----------
+async def stream_agent(user_query: str, case_id: str = "stream", user_role: str = "admin"):
+    """深度模式：六节点 Reflection Loop，带进度反馈 + 正文流式"""
+    init_state: AgentState = {
+        "user_query": user_query,
+        "case_id": case_id,
+        "user_id": "stream_user",
+        "user_role": user_role,
+        "task_list": [],
+        "current_task": None,
+        "context_local_kb": "",
+        "context_from_web": "",
+        "think_trace": [],
+        "raw_tool_obs": [],
+        "intermediate_answer": "",
+        "final_answer": "",
+        "need_more_info": False,
+        "loop_count": 0,
+        "tavily_cache": {},
+        "ref_docs": []
+    }
+
+    last_node = None
+    async for event in app.astream_events(
+        init_state,
+        config={"recursion_limit": GRAPH_RECURSION_LIMIT},
+        version="v2"
+    ):
+        kind = event["event"]
+        node = event.get("metadata", {}).get("langgraph_node", "")
+
+        if kind == "on_chain_start" and node in NODE_LABELS and node != last_node:
+            last_node = node
+            yield f"{PROGRESS_PREFIX}{NODE_LABELS[node]}"
+
+        if kind == "on_chat_model_stream" and node == "summary_node":
+            chunk = event["data"]["chunk"]
+            if hasattr(chunk, "content") and chunk.content:
+                yield chunk.content
+
+
+# ---------- 快速模式（RAG + 单次 LLM） ----------
+QUICK_PROMPT = """你是制造业MES业务专家。基于参考资料简洁回答。
+
+【硬性要求】
+- 100~150 字以内，绝不超 200 字
+- 直接列 3~4 个要点，不要标题、不要铺垫、不要"综上所述"
+- 不要写"根据参考资料"
+
+参考资料：
+{kb_ctx}
+
+问题：{user_query}
+
+回答："""
+
+
+def quick_answer_stream(user_query: str, user_role: str = "admin"):
+    """快速模式（流式）：跳过 Reranker，只做向量 Top-2 + LLM 流式"""
+    try:
+        vector_db = _get_vector_db()
+        docs = vector_db.similarity_search(user_query, k=2)
+        kb_ctx = "\n\n".join([d.page_content for d in docs])
+    except Exception as e:
+        print(f"【quick_answer_stream】检索异常：{e}")
+        kb_ctx = ""
+
+    if not kb_ctx:
+        kb_ctx = "（无参考资料）"
+
+    prompt = QUICK_PROMPT.replace("{kb_ctx}", kb_ctx[:800]).replace("{user_query}", user_query)
+    for chunk in llm.stream(prompt):
+        if hasattr(chunk, "content") and chunk.content:
+            yield chunk.content
+
+
+def quick_answer(user_query: str, user_role: str = "admin") -> str:
+    """极速模式：向量 Top-2（跳过 Reranker）+ 单次 LLM，目标 < 7s"""
+    import time as _t
+    t0 = _t.time()
+
+    # 1. 向量检索（只取 2 条，不做 Rerank）
+    kb_ctx = ""
+    try:
+        vector_db = _get_vector_db()
+        docs = vector_db.similarity_search(user_query, k=2)
+        kb_ctx = "\n\n".join([d.page_content for d in docs])
+        print(f"【quick_answer】检索 Top-2 耗时 {_t.time()-t0:.2f}s")
+    except Exception as e:
+        print(f"【quick_answer】检索异常：{e}")
+
+    if not kb_ctx:
+        kb_ctx = "（无参考资料）"
+
+    # 2. 单次 LLM
+    t1 = _t.time()
+    prompt = QUICK_PROMPT.replace("{kb_ctx}", kb_ctx[:800]).replace("{user_query}", user_query)
+    resp = llm.invoke(prompt)
+    llm_t = _t.time() - t1
+    total_t = _t.time() - t0
+    print(f"【quick_answer】LLM 耗时 {llm_t:.2f}s | 总计 {total_t:.2f}s")
+    return resp.content
+
+# ========== 流式输出辅助函数结束 ==========
+
+
 # 主入口
 if __name__ == "__main__":
     print("\n==== Graph Mermaid ====")
@@ -760,7 +1047,7 @@ if __name__ == "__main__":
     print("\n==== Running Agent ====\n")
     init_state: AgentState = {
         "case_id": "local_debug",
-        "user_query": "什么是MES系统中的工单管理",
+        "user_query": "请按照BOM版本V99查询产品P-200的物料清单",
         "user_id": "local_user",
         "user_role": "admin",
         "task_list": [],

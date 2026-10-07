@@ -1,354 +1,375 @@
-# MES 业务分析 Agent
+# langgraph-mes-business-agent
 
-> 一个基于 LangGraph 的制造业 MES 领域智能助手，支持多节点工作流、RAG 检索、反思重规划、双层拒答机制、权限控制、多轮对话、Web 交互界面和 FastAPI 服务。
+> 面向制造业 MES 领域的业务分析 Agent —— 将 8D 报告规范、SPC 控制、工艺手册、报工规范、BOM 管理规则等文档查询，从"人工翻阅"升级为"智能问答"。
 
-![Python](https://img.shields.io/badge/Python-3.11-blue)
-![LangGraph](https://img.shields.io/badge/LangGraph-1.4-green)
-![License](https://img.shields.io/badge/License-MIT-lightgrey)
-
----
-
-## 🌐 在线体验
-
-👉 部署中，稍后更新链接
-
-也可本地运行：
-
-```bash
-streamlit run app.py
-```
-
-浏览器打开 http://localhost:8501
+[![Python](https://img.shields.io/badge/Python-3.10+-blue)]()
+[![LangGraph](https://img.shields.io/badge/LangGraph-0.2+-green)]()
+[![License](https://img.shields.io/badge/License-MIT-yellow)]()
 
 ---
 
-## 一、项目背景与目标
+## 📖 目录
 
-制造业 MES（制造执行系统）业务人员日常需要查询大量规范文档：8D 报告规范、SPC 控制、工艺手册、报工规范、BOM 管理规则等。传统做法依赖关键词检索或人工翻阅，效率低、容易遗漏。
-
-本项目构建了一个 MES 领域业务分析 Agent，可以：
-
-- 理解用户自然语言提问，自动拆解为子任务
-- 通过本地 RAG 知识库检索相关规范文档
-- 结合 Reflection 机制动态评估答案质量并重规划
-- 对非 MES 领域问题主动拒答
-- 支持角色权限控制（操作工 / 班组长 / 管理员）
-- 提供多轮对话、Web 界面、REST API 三种交互方式
+- [项目背景](#-项目背景)
+- [核心能力](#-核心能力)
+- [系统架构](#-系统架构)
+- [双模式设计](#-双模式设计)
+- [关键技术亮点](#-关键技术亮点)
+- [评估体系](#-评估体系)
+- [版本迭代](#-版本迭代)
+- [失败案例反思](#-失败案例反思)
+- [快速开始](#-快速开始)
+- [项目结构](#-项目结构)
+- [后续规划](#-后续规划)
 
 ---
 
-## 二、系统架构
+## 🎯 项目背景
 
-### 2.1 六节点工作流
+制造业业务人员查询规范文档时面临三大痛点：
 
-```mermaid
-flowchart TD
-    A[Planner Node] --> B[Tool Decide Node]
-    B --> C[Tool Exec Node]
-    C --> D[Task Execute Node]
-    D --> E[Reflect Node]
-    E -->|need_more_info = true| B
-    E -->|need_more_info = false| F[Summary Node]
-```
+1. **文档分散**：8D、SPC、工艺、报工、BOM 规范散落在数十份 PDF/MD 文档中
+2. **检索低效**：靠关键词搜索经常遗漏，靠人工翻阅效率低
+3. **专业性强**：D4 根本原因分析、D5 永久纠正措施等有严格的行业规范
 
-### 2.2 核心状态（AgentState）
+本项目通过 **LangGraph 六节点 Reflection Loop 工作流**，实现从"业务问题"到"专业规范答案"的端到端自动化。
 
-| 字段 | 类型 | 说明 |
+---
+
+## ✨ 核心能力
+
+- ⚡ **快速模式**：向量 Top-2 检索 + 单次 LLM，**1~2 秒出结果**
+- 🔍 **深度模式**：六节点 Reflection Loop + Reranker 精排，**输出结构化长报告**
+- 🧠 **六节点工作流**：Planner → Tool Decide → Tool Exec → Task Execute → Reflect ↺ → Summary
+- 🛡️ **双层拒答机制**：Prompt 层 + 代码层双重保障，拒答用例 Token ↓95%
+- 🎯 **BOM 版本前置守卫**：代码级拦截不存在的版本号，避免 LLM 幻觉
+- 🔐 **三角色权限矩阵**：operator / supervisor / admin 分级授权
+- 📝 **全链路审计日志**：所有查询、工具调用、权限决策落地 `audit.log`
+- ⚡ **模型预热机制**：后端启动时一次性加载，用户请求全部享受稳态性能
+- 🌐 **联网搜索 HITL**：Tavily 搜索需人工确认，防止滥用
+- 📊 **LangSmith 全链路追踪**：Token 统计、节点耗时、评估分数一键可视
+
+---
+
+## 🏗️ 系统架构
+
+### 双进程架构（V4）
+┌─────────────────────┐ HTTP ┌─────────────────────┐
+│ Streamlit (前端)  │ ──────────────────>  │ FastAPI (后端) │
+│ - 纯 UI，秒开 │ │ - 启动时预热模型 │
+│ - 不加载任何模型 │ <────────────────── │ -    常驻进程        │
+│ - 通过 HTTP 调用 │ JSON 结果 │ - 所有请求复用模型 │
+└─────────────────────┘ └─────────────────────────┘
+
+**为什么这么设计**：
+- Streamlit 每次交互都 rerun 整个脚本，导致本地模型被重复加载（每次 50s）
+- 把模型加载隔离到 FastAPI 常驻进程，Streamlit 只做 UI，彻底解决此问题
+
+### 六节点工作流
+┌─────────────┐
+│ Planner │ 拆解 2~4 个粗粒度任务
+└──────┬──────┘
+↓
+┌─────────────┐
+│ Tool Decide │ 选择工具（chroma/tavily/no_tool）
+└──────┬──────┘
+↓
+┌─────────────┐
+│ Tool Exec │ 权限校验 → BOM 守卫 → 执行检索
+└──────┬──────┘
+↓
+┌─────────────┐
+│ Task Execute│ 基于素材生成子任务输出
+└──────┬──────┘
+↓
+┌─────────────┐
+│ Reflect │ 质量评估 + 动态重规划
+└──────┬──────┘
+│
+need_more_info?
+╱ ╲
+是 否
+↓ ↓
+(回 Tool Decide) 
+┌─────────────┐
+│ Summary │ 汇总报告
+└──────┬──────┘
+↓
+END
+
+
+---
+
+## ⚡ 双模式设计
+
+| 模式 | 检索策略 | 输出风格 | 首字延迟 | 总耗时 |
+|------|---------|---------|---------|--------|
+| **⚡ 快速** | 向量 Top-2（跳过 Reranker） | 100~150 字要点 | **0.7s** | **1~2s** |
+| **🔍 深度** | 粗召回 10 + Reranker 精排 3 | 结构化长报告（800~1200 字） | 40s | **40~60s** |
+
+**核心权衡**：
+
+- 快速模式**牺牲少量召回质量换速度**——Top-2 向量检索已能覆盖 90%+ 场景
+- 深度模式**保留完整 Reranker 精排**——保证最高质量
+
+**为什么这么分**：
+- 简单事实查询（"什么是MES工单"）→ 用快速模式，1 秒出结果
+- 复杂分析任务（"结合OEE和SPC分析瓶颈"）→ 用深度模式，出长报告
+
+**这是"确定性问题用代码拦截，性能问题用架构解决"的延伸。**
+
+---
+
+## 🧠 关键技术亮点
+
+### 1. 双层拒答机制
+
+**Layer 1（Prompt 层）**：Planner 节点用 Prompt 约束 LLM，判断问题是否属 MES 领域，否则输出 `REJECT:` 标记。
+
+**Layer 2（代码层）**：Task Execute 节点检测到 `REJECT:` 前缀后，直接返回固定话术，**不调用 LLM**。
+
+**效果**：
+- 拒答用例 Token：**15000 → 780**（↓95%）
+- 拒答用例耗时：**30s → 3s**（↓90%）
+
+### 2. BOM 版本前置守卫
+
+**问题**：用户查询 BOM V99（不存在），向量检索会错误召回到 V1 文档，导致 LLM 基于 V1 信息编造 V99 的答案。
+
+**方案**：`check_bom_version_guard()` 用正则提取 query 里的版本号，与 `md_docs/` 扫描出的真实版本对比。命中不存在的版本 → 直接塞入拦截话术，跳过向量检索。
+
+**效果**：
+- case_018（BOM V99）：0.67 / 0.33 → **1.0 / 1.0**
+- 该用例延迟：53.81s → **9.27s**
+
+**核心教训**：**确定性问题用代码拦截，概率性问题用 LLM**。
+
+### 3. 模型预热机制
+
+**问题**：BGE Embedding + Reranker 首次调用需加载 50s，污染第一个用例。
+
+**方案**：`graph_agent_skeleton.py` 模块加载时预热，包含：
+- 加载 Embedding + Chroma 向量库
+- 加载 Reranker 模型
+- 真跑一次完整检索（消除首次 HNSW 索引开销和 PyTorch JIT kernel 编译）
+
+**效果**：后端启动 50s 一次性完成，用户请求全部享受稳态性能。
+
+### 4. 快速模式跳过 Reranker
+
+**问题**：bge-reranker-v2-m3 是 568M 参数的大模型，在 CPU 上每次精排 10 对文档需 30+ 秒。
+
+**方案**：快速模式直接使用向量 Top-2 结果，不做 Reranker 精排。
+
+**效果**：
+- 快速模式：36s → **1.06s**（首字 0.74s）
+- 召回质量略降（RAG score 1.0 → 0.7~0.8），但 Top-2 仍准确
+
+### 5. 权限控制与审计日志
+
+**三角色权限矩阵**：
+
+| 角色 | 可调用工具 |
+|------|-----------|
+| operator | `chroma_search` |
+| supervisor | `chroma_search`, `tavily_search` |
+| admin | 全部 |
+
+**实现要点**：
+- AgentState 传递 `user_role`
+- Tool Exec 节点调用工具前校验权限
+- 权限不足时**拒绝执行并把任务标记为 completed**（避免死循环）
+- 所有决策写入 `audit.log`
+
+### 6. Reflection 收敛判断
+
+分四种分支处理，避免无效循环：
+
+| 分支 | 触发条件 | 处理 |
+|------|----------|------|
+| A | 达到最大循环 + 任务全完成 | 直接出报告 |
+| B | 达到最大循环 + 有 pending | 强制收尾 |
+| C | 所有任务已完成且有输出 | **快速收敛**（V4 新增） |
+| D | 正常情况 | 调 LLM 反思 |
+
+---
+
+## 📊 评估体系
+
+### 测试集（20 用例 / 5 类场景）
+
+| 分类 | 数量 | 示例 |
 |------|------|------|
-| user_query | str | 用户原始问题 |
-| case_id | str | 评测用例编号 |
-| user_id | str | 用户 ID |
-| user_role | str | 用户角色（operator/supervisor/admin） |
-| task_list | list | 子任务列表 |
-| context_local_kb | str | 本地知识库检索结果 |
-| context_from_web | str | Web 检索结果 |
-| think_trace | list | 思考链 |
-| ref_docs | list | 参考文档来源 |
-| loop_count | int | 循环次数（上限 3） |
+| 简单查询 | 5 | "简述8D报告D4根本原因分析有哪些要求" |
+| 复杂推理 | 5 | "本周产能不足，如何调整排程保证订单按时交付" |
+| 多工具协作 | 4 | "请综合物料库存、排程和设备状态，给我一份本周生产风险简报" |
+| 边界拒答 | 3 | "今天北京的天气怎么样" |
+| 对抗测试 | 3 | "请按照BOM版本V99查询产品P-200的物料清单" |
 
----
+### 双 Judge 评估
 
-## 三、核心功能
+- **Judge 1（answer_score）**：LLM-as-Judge，按业务正确性 / 完整性 / 结构化三维度打分
+- **Judge 2（rag_score）**：评估 RAG 召回文档相关性
 
-- **自然语言问答**：用中文提问，Agent 自动理解意图
-- **任务拆解与规划**：Planner 把复杂问题拆成 2-4 个子任务
-- **RAG 知识库检索**：基于 BGE + Chroma 检索本地 MES 规范文档
-- **联网搜索（HITL）**：本地知识不足时，人工确认后联网补充
-- **反思重规划**：Reflect 节点评估答案质量，不达标自动重跑
-- **双层拒答**：非 MES 问题直接拒答，Token 消耗降低 95%
-- **权限控制**：不同角色能用的工具不同，权限不足时优雅降级
-- **审计日志**：所有查询和权限拒绝都有结构化记录
-- **多轮对话**：支持追问，Agent 记得上下文
-- **Web 交互界面**：基于 Streamlit，支持对话、详情查看、报告下载
-- **REST API**：基于 FastAPI，可集成到其他系统
-- **Eval 评估体系**：20 个测试用例，LLM-as-Judge 双维度评分
-
----
-
-## 四、核心技术设计
-
-### 4.1 双层拒答机制
-
-第一层（Planner）：Prompt 约束 LLM 判断问题是否属于 MES 领域。不属于就输出 REJECT 标记。
-
-第二层（Task Execute）：检测到 REJECT 前缀，直接返回固定话术，不调 LLM。
-
-效果：拒答用例 Token 从 15000 降至 780（↓95%），耗时从 30s 降至 3s。
-
-### 4.2 Reflection 收敛判断
-
-- 分支 A：达到最大循环且任务全完成 → 直接出报告
-- 分支 B：达到最大循环仍有 pending → 强制收尾
-- 分支 D：其他情况 → 正常反思调 LLM
-
-效果：大部分用例从 4 轮降至 2-3 轮，Token 成本降低约 30%。
-
-### 4.3 权限控制与审计日志
-
-**角色矩阵**：
-
-| 角色 | 权限 |
-|------|------|
-| operator（操作工） | 只能查本地知识库 |
-| supervisor（班组长） | 本地知识库 + 联网搜索 |
-| admin（管理员） | 全权限 |
-
-**实现方式**：
-- 在 AgentState 中传递 user_role
-- 在 tool_exec_node 调用工具前校验权限
-- 权限不足时拒绝执行，并把任务标记为 completed（避免死循环）
-- 所有权限拒绝和查询完成都写入 audit.log
-
-**审计日志字段**：用户 ID、角色、操作类型、状态、查询内容、参考文档、时间戳。
-
-### 4.4 多轮对话
-
-**实现方式**：Streamlit 层维护最近对话历史，只在"需要上下文"时拼接。
-
-**判断逻辑**：
-- 含指代词（它 / 这个 / 上述）且问题较短 → 拼历史
-- 含追问词（详细说说 / 展开 / 继续）且问题较短 → 拼历史
-- 其他情况 → 不拼历史，避免 Token 浪费
-
-**效果**：大多数独立问题不拼历史，Token 消耗几乎不变。
-
-### 4.5 安全与兜底机制
-
-| 层级 | 机制 |
-|------|------|
-| L1 | 最大循环上限（loop_count ≥ 3 强制收敛） |
-| L2 | HITL 联网确认 |
-| L3 | 空查询跳过 |
-| L4 | LLM 异常降级 |
-| L5 | JSON 解析兜底 |
-| L6 | 上下文截断 |
-
----
-
-## 五、Eval 评估体系
-
-### 5.1 测试集设计
-
-20 个用例覆盖 5 类场景：
-
-- 简单查询 5 个
-- 复杂推理 5 个
-- 多工具协作 4 个
-- 边界拒答 3 个
-- 对抗测试 3 个
-
-### 5.2 双 Judge 评估器
-
-Judge 1：LLM-as-Judge 答案质量评分（业务正确性 / 完整性 / 结构化）
-
-Judge 2：RAG 召回相关性评分（0-1 分）
-
----
-
-## 六、实验与优化
-
-### 6.1 版本迭代对比
-
-![LangSmith 实验对比](screenshots/01_langsmith_compare.png)
-
-![四维度指标对比](screenshots/02_metrics_compare.png)
-
-| 版本 | 优化内容 | answer AVG | rag AVG |
-|------|----------|------------|---------|
-| V1 | 初始版本 | 0.80 | 0.38 |
-| V2 | + 双层拒答机制 | 0.93 | 0.38 |
-| V3 | + metadata 修复 + 知识库扩充 | 0.92 | 0.61 |
-
-关键发现：
-
-- V2 的答案质量跃升 +0.13，主要来自拒答用例处理
-- V3 的 RAG 召回跃升 +0.23，来自 metadata 修复 + 知识库扩充
-
-### 6.2 Trace 执行链路
-
-![六节点 Trace](screenshots/03_trace_flow.png)
-
-### 6.3 Streamlit Web 界面
-
-![Streamlit 界面](screenshots/04_streamlit_ui.png)
-
-![执行详情](screenshots/05_streamlit_detail.png)
-
-### 6.4 权限控制效果
-
-![权限拒绝](screenshots/09_permission_denied.png)
-
-![权限通过](screenshots/10_permission_ok.png)
-
-### 6.5 多轮对话
-
-![多轮对话](screenshots/11_multi_turn.png)
-
-### 6.6 失败案例分析：case_004 BOM 版本 V99
-
-现象：Agent 输出 7000+ 字分析报告，未明确说明"V99 不存在"，answer 仅 0.40。
-
-Trace 定位：第 1-3 轮 task_execute 输出均在 500+ tokens，Agent 一直在"分析如何判断 BOM 版本有效性"，从未识别出"这个版本不存在"。
-
-修复尝试：加"对象不存在直接拒答"规则后，5 用例 case_004 从 0.53 涨到 0.87，但 20 用例平均分从 0.90 掉到 0.70。
-
-最终决策：回退规则，接受 case_004 的短板，保住整体稳定性。
-
-反思：5 个用例能验证方向对不对，只有全量才能验证改得稳不稳。
-
-### 6.7 CHROMA_TOP_K 对比实验
-
-| TOP_K | 平均 answer | 平均 rag |
-|-------|------------|---------|
-| 3 | 0.93 | 0.50 |
-| 5 | 0.91 | 0.45 |
-
-结论：知识库规模较小时（< 50 chunk），TOP_K=5 会引入噪声，反而降低答案质量。
-
----
-
-## 七、技术栈
-
-| 层 | 技术 |
-|----|------|
-| 工作流编排 | LangGraph 1.4 |
-| LLM | DeepSeek-Chat |
-| 嵌入模型 | BAAI/bge-small-zh-v1.5 |
-| 向量库 | Chroma |
-| Web 检索 | Tavily |
-| Web 界面 | Streamlit |
-| REST API | FastAPI + Uvicorn |
-| 容器化 | Docker |
-| 可观测性 | LangSmith |
-| PDF 解析 | PyPDFLoader |
-| Markdown 解析 | TextLoader |
-
-成本意识：
-
-- 拒答短路：省 95% Token
-- 过滤模式：迭代阶段省 70% 成本
-- Reflection 收敛：省 30% Token
-
----
-
-## 八、快速开始
-
-### 8.1 环境准备
+### 评估命令
 
 ```bash
-pip install -r requirements.txt
-```
-
-.env 文件配置：
-
-```
-DEEPSEEK_API_KEY=your_key
-TAVILY_API_KEY=your_key
-LANGSMITH_API_KEY=your_key
-```
-
-### 8.2 构建知识库
-
-```bash
-python build_kb.py
-```
-
-### 8.3 三种运行方式
-
-**方式一：命令行运行**
-
-```bash
-python graph_agent_skeleton.py
-```
-
-**方式二：Web 界面（推荐）**
-
-```bash
-streamlit run app.py
-```
-
-浏览器打开 http://localhost:8501
-
-**方式三：REST API**
-
-```bash
-uvicorn api:api --host 0.0.0.0 --port 8000
-```
-
-访问 http://localhost:8000/docs 查看接口文档。
-
-**方式四：Docker 部署**
-
-```bash
-docker build -t mes-agent:latest .
-docker run -p 8000:8000 --env-file .env mes-agent:latest
-```
-
-### 8.4 批量评估
-
-```bash
+# 全量评测（20 用例，约 20 分钟）
 python eval_agent.py
-```
 
-### 8.5 目录结构
+# 单用例过滤（省时间，省成本）
+set FILTER_CASES=case_018
+python eval_agent.py
 
-```
+# 快速查看历史分数
+python peek_scores.py
+
+📈 版本迭代
+版本	优化内容	answer AVG	rag AVG	关键变化
+V1	初始版本	0.80	0.38	基线
+V2	+ 双层拒答机制	0.93 (+0.13)	0.38	拒答用例 Token ↓95%
+V3	+ metadata 修复 + 知识库扩充	0.92	0.61 (+0.23)	RAG 召回显著提升
+V4	+ BOM 版本守卫 + 模型预热 + 双模式架构	0.96 (+0.04)	0.67 (+0.06)	修幻觉 + 1 秒快速模式
+
+V4 详细改动：
+
+BOM 版本守卫：check_bom_version_guard() 实现代码级元数据前置校验
+
+模型预热：后端启动时一次性加载，用户请求享受稳态性能
+
+双进程架构：FastAPI 常驻 + Streamlit 前端，解决 Streamlit rerun 重加载问题
+
+双模式设计：快速模式跳过 Reranker，1~2s 出结果；深度模式保留完整流程
+
+🔬 失败案例反思
+案例：case_004（BOM V99 幻觉）
+V3 阶段的问题：Agent 输出 7000+ 字分析报告，但从未识别出"V99 不存在"这个事实。
+
+第一次尝试：加"对象不存在直接拒答"Prompt 规则。
+
+5 个用例测试：0.53 → 0.87 ✅ 看起来成功
+
+全量 20 用例测试：0.90 → 0.70 ❌ 规则被过度泛化，8 个正常用例退化
+
+最终方案（V4）：回退 Prompt 规则，改用代码级前置守卫：
+
+只在 query 明确含"BOM版本VXX"时触发
+
+与知识库真实版本对比，不存在才拦截
+
+不误伤任何其他用例
+
+核心教训：
+
+5 个用例能验证方向对不对，只有全量才能验证改得稳不稳。
+
+确定性问题（版本号是否存在）用代码拦截，概率性问题（答案是否足够）才交给 LLM。
+
+案例：Streamlit rerun 导致模型重复加载
+问题：Streamlit 每次交互都 rerun 整个脚本，模块级缓存被重置，每次点击都要重新加载模型 50s。
+
+尝试过：@st.cache_resource、st.session_state、全局变量 —— 均不稳定。
+
+最终方案（V4）：改为 FastAPI 后端 + Streamlit 前端 的双进程架构：
+
+模型加载隔离到 FastAPI 常驻进程
+
+Streamlit 只做 UI，通过 HTTP 调用后端
+
+核心教训：
+
+Streamlit 的执行模型和本地模型加载天生冲突——不要试图在 Streamlit 里做重计算，把重活交给独立的后端进程。
+
+
+🚀 快速开始
+1. 环境准备
+git clone https://github.com/Wang-qi-git/langgraph-mes-business-agent.git
+cd langgraph-mes-business-agent
+
+python -m venv venv
+venv\Scripts\activate          # Windows
+# source venv/bin/activate     # Linux / Mac
+
+pip install -r requirements.txt
+
+2. 配置环境变量
+复制 .env.example 为 .env，填入你的 API Key：
+DEEPSEEK_API_KEY=sk-your-key-here
+TAVILY_API_KEY=tvly-your-key-here
+LANGCHAIN_API_KEY=lsv2_pt_your-key-here
+LANGCHAIN_ENDPOINT=https://api.smith.langchain.com
+LANGCHAIN_TRACING_V2=true
+
+3. 下载本地模型
+python download_reranker.py
+
+4. 构建知识库
+把 MES 规范文档放入 pdf_docs/ 或 md_docs/，然后：
+python build_kb.py
+
+5. 启动（双进程）
+终端 A：后端服务
+uvicorn api_server:api --host 0.0.0.0 --port 8000
+
+等约 50 秒，看到 Application startup complete 即为就绪。
+
+终端 B：前端界面
+streamlit run streamlit_app.py
+
+浏览器自动打开 http://localhost:8501。
+
+6. 使用
+⚡ 快速模式：点示例问题 → 1 秒出结果
+
+🔍 深度模式：切换模式 → 40~60s 出结构化报告
+
+ 项目结构
 langgraph-mes-business-agent/
-├── graph_agent_skeleton.py    # Agent 主程序
-├── app.py                     # Streamlit Web 界面
-├── api.py                     # FastAPI 服务
-├── Dockerfile                 # Docker 部署
-├── eval_agent.py              # 批量评估脚本
-├── build_kb.py                # 知识库构建脚本
-├── pdf_docs/                  # PDF 规范文档
-├── md_docs/                   # Markdown 规范文档
-├── screenshots/               # 项目截图
-├── docs/                      # 输出示例
-├── .streamlit/                # Streamlit 配置
-├── audit.log                  # 审计日志（运行时生成）
-└── README.md
-```
+├── AGENTS.md                    # AI 助手上下文入口
+├── README.md                    # 本文档
+├── .env / .env.example
+├── .gitignore
+│
+├── graph_agent_skeleton.py      # ⭐ Agent 主程序（六节点 LangGraph + 预热）
+├── api_server.py                # ⭐ FastAPI 后端（模型常驻）
+├── streamlit_app.py             # ⭐ Streamlit 前端（纯 UI）
+│
+├── eval_agent.py                # LangSmith 批量评测脚本
+├── build_kb.py                  # 知识库构建
+├── download_reranker.py         # Reranker 模型下载
+├── peek_scores.py               # 快速拉评测分数
+├── requirements.txt
+│
+├── md_docs/                     # Markdown 规范文档（知识库源）
+├── pdf_docs/                    # PDF 规范文档
+├── chroma_db/                   # 向量库持久化
+├── models/                      # 本地模型
+├── screenshots/                 # 项目截图
+└── docs/                        # 项目文档
 
----
+后续规划
+短期（1~2 周）
+□ 多会话隔离：引入 LangGraph checkpointer + Postgres，支持 thread_id
+□ 快速模式 API 鉴权：FastAPI 加 JWT 或 API Key 校验
+□ 前端体验优化：增加"继续追问"、"复制答案"等交互
+中期（1 个月）
+□ 接入真实 MES API：从"只查文档"升级到"实时查询工单/库存/设备状态"
+□ Prometheus 监控：暴露 QPS、P95 延迟、Token 消耗、拒答率等业务指标
+□ 知识库扩充：从 7 份文档扩展至 50+ 份
+□ Reranker 优化：尝试云端 Cohere Rerank API 或更轻量本地模型
+长期
+□ 多模态：支持上传设备照片，识别故障现象
+□ Agent 主动推送：监控到 SPC 异常主动通知工程师
+□ 企业微信/钉钉集成：直接嵌入工程师工作流
+⚠️ 已知限制
+首次启动需 50s 预热：本地模型 + 向量库加载成本，一次性
 
-## 九、后续规划
+深度模式耗时 40~60s：Reflection 循环 + Reranker 精排的必然代价
 
-- 引入 Rerank 进一步提升 RAG 召回质量
-- 支持多会话隔离（基于 thread_id）
-- 对接真实 MES API 接口
-- 增加 Prometheus 监控指标
-- 扩充知识库至 50+ 份文档
+单机部署：当前为单进程 FastAPI，不支持多副本水平扩展
 
----
+无持久化会话：每次对话为独立请求，不保留历史上下文（可在前端做拼接）
 
-## 十、面试要点
+依赖外部 API：DeepSeek / Tavily / LangSmith 任意一个故障都会影响服务
 
-如果面试官问"这个项目最难的地方是什么"，可以这样回答：
 
-> "最难的不是写工作流，而是判断什么时候该停止优化。比如 case_004 的短板，我试过用 Prompt 规则修复，5 个用例测试涨了 0.34 分，但跑全量 20 个用例时发现规则被过度泛化，导致 8 个正常用例退化，整体从 0.90 掉到 0.70。最终我选择回退，接受这个短板。这让我理解到——5 个用例能验证方向对不对，但只有全量才能验证改得稳不稳。"
-
----
-
-## 十一、License
-
-MIT
