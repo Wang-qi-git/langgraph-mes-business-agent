@@ -15,3 +15,5 @@ tavily-python
 langsmith
 python-dotenv
 streamlit
+fastapi
+uvicorn
