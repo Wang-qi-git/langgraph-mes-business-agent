@@ -1,6 +1,6 @@
 # MES 业务分析 Agent
 
-> 一个基于 LangGraph 的制造业 MES 领域智能助手，支持多节点工作流、RAG 检索、反思重规划、双层拒答机制、Web 交互界面。
+> 一个基于 LangGraph 的制造业 MES 领域智能助手，支持多节点工作流、RAG 检索、反思重规划、双层拒答机制、权限控制、多轮对话、Web 交互界面和 FastAPI 服务。
 
 ![Python](https://img.shields.io/badge/Python-3.11-blue)
 ![LangGraph](https://img.shields.io/badge/LangGraph-1.4-green)
@@ -32,7 +32,8 @@ streamlit run app.py
 - 通过本地 RAG 知识库检索相关规范文档
 - 结合 Reflection 机制动态评估答案质量并重规划
 - 对非 MES 领域问题主动拒答
-- 提供 Streamlit Web 界面，支持对话、详情查看、报告下载
+- 支持角色权限控制（操作工 / 班组长 / 管理员）
+- 提供多轮对话、Web 界面、REST API 三种交互方式
 
 ---
 
@@ -56,6 +57,8 @@ flowchart TD
 |------|------|------|
 | user_query | str | 用户原始问题 |
 | case_id | str | 评测用例编号 |
+| user_id | str | 用户 ID |
+| user_role | str | 用户角色（operator/supervisor/admin） |
 | task_list | list | 子任务列表 |
 | context_local_kb | str | 本地知识库检索结果 |
 | context_from_web | str | Web 检索结果 |
@@ -67,15 +70,18 @@ flowchart TD
 
 ## 三、核心功能
 
-- 自然语言问答：用中文提问，Agent 自动理解意图并回答
-- 任务拆解与规划：Planner 把复杂问题拆成 2-4 个子任务
-- RAG 知识库检索：基于 BGE + Chroma 检索本地 MES 规范文档
-- 联网搜索（HITL）：本地知识不足时，人工确认后联网补充
-- 反思重规划：Reflect 节点评估答案质量，不达标自动重跑
-- 双层拒答：非 MES 问题直接拒答，Token 消耗降低 95%
-- 结构化报告输出：Summary 节点生成完整分析报告
-- Web 交互界面：基于 Streamlit，支持对话、执行详情查看、报告下载
-- Eval 评估体系：20 个测试用例，LLM-as-Judge 双维度评分
+- **自然语言问答**：用中文提问，Agent 自动理解意图
+- **任务拆解与规划**：Planner 把复杂问题拆成 2-4 个子任务
+- **RAG 知识库检索**：基于 BGE + Chroma 检索本地 MES 规范文档
+- **联网搜索（HITL）**：本地知识不足时，人工确认后联网补充
+- **反思重规划**：Reflect 节点评估答案质量，不达标自动重跑
+- **双层拒答**：非 MES 问题直接拒答，Token 消耗降低 95%
+- **权限控制**：不同角色能用的工具不同，权限不足时优雅降级
+- **审计日志**：所有查询和权限拒绝都有结构化记录
+- **多轮对话**：支持追问，Agent 记得上下文
+- **Web 交互界面**：基于 Streamlit，支持对话、详情查看、报告下载
+- **REST API**：基于 FastAPI，可集成到其他系统
+- **Eval 评估体系**：20 个测试用例，LLM-as-Judge 双维度评分
 
 ---
 
@@ -87,7 +93,7 @@ flowchart TD
 
 第二层（Task Execute）：检测到 REJECT 前缀，直接返回固定话术，不调 LLM。
 
-效果：拒答用例 Token 从 15000 降至 780（↓95%），耗时从 30s 降至 3s，答案质量从 0.20 提升至 1.00。
+效果：拒答用例 Token 从 15000 降至 780（↓95%），耗时从 30s 降至 3s。
 
 ### 4.2 Reflection 收敛判断
 
@@ -97,15 +103,34 @@ flowchart TD
 
 效果：大部分用例从 4 轮降至 2-3 轮，Token 成本降低约 30%。
 
-### 4.3 Human-in-the-loop 联网确认
+### 4.3 权限控制与审计日志
 
-联网搜索前触发人工确认，通过环境变量在演示模式和评测模式间切换。
+**角色矩阵**：
 
-### 4.4 RAG 检索优化
+| 角色 | 权限 |
+|------|------|
+| operator（操作工） | 只能查本地知识库 |
+| supervisor（班组长） | 本地知识库 + 联网搜索 |
+| admin（管理员） | 全权限 |
 
-知识库构成：3 份 PDF + 7 份 Markdown，共 25 个 chunk，采用 BGE-small-zh-v1.5 中文向量模型。
+**实现方式**：
+- 在 AgentState 中传递 user_role
+- 在 tool_exec_node 调用工具前校验权限
+- 权限不足时拒绝执行，并把任务标记为 completed（避免死循环）
+- 所有权限拒绝和查询完成都写入 audit.log
 
-关键修复：定位到 chroma_search 读取了不存在的 metadata 字段 source_file（实际 PyPDFLoader 只写 source），导致所有检索结果 fallback 为"未知文档"。修复后 Judge 能正确判断文档相关性。
+**审计日志字段**：用户 ID、角色、操作类型、状态、查询内容、参考文档、时间戳。
+
+### 4.4 多轮对话
+
+**实现方式**：Streamlit 层维护最近对话历史，只在"需要上下文"时拼接。
+
+**判断逻辑**：
+- 含指代词（它 / 这个 / 上述）且问题较短 → 拼历史
+- 含追问词（详细说说 / 展开 / 继续）且问题较短 → 拼历史
+- 其他情况 → 不拼历史，避免 Token 浪费
+
+**效果**：大多数独立问题不拼历史，Token 消耗几乎不变。
 
 ### 4.5 安全与兜底机制
 
@@ -138,11 +163,6 @@ Judge 1：LLM-as-Judge 答案质量评分（业务正确性 / 完整性 / 结构
 
 Judge 2：RAG 召回相关性评分（0-1 分）
 
-### 5.3 评测框架
-
-- 基于 LangSmith 的 evaluate API
-- 支持 FILTER_CASES 环境变量控制测试集规模
-
 ---
 
 ## 六、实验与优化
@@ -174,7 +194,17 @@ Judge 2：RAG 召回相关性评分（0-1 分）
 
 ![执行详情](screenshots/05_streamlit_detail.png)
 
-### 6.4 失败案例分析：case_004 BOM 版本 V99
+### 6.4 权限控制效果
+
+![权限拒绝](screenshots/09_permission_denied.png)
+
+![权限通过](screenshots/10_permission_ok.png)
+
+### 6.5 多轮对话
+
+![多轮对话](screenshots/11_multi_turn.png)
+
+### 6.6 失败案例分析：case_004 BOM 版本 V99
 
 现象：Agent 输出 7000+ 字分析报告，未明确说明"V99 不存在"，answer 仅 0.40。
 
@@ -186,7 +216,7 @@ Trace 定位：第 1-3 轮 task_execute 输出均在 500+ tokens，Agent 一直�
 
 反思：5 个用例能验证方向对不对，只有全量才能验证改得稳不稳。
 
-### 6.5 CHROMA_TOP_K 对比实验
+### 6.7 CHROMA_TOP_K 对比实验
 
 | TOP_K | 平均 answer | 平均 rag |
 |-------|------------|---------|
@@ -207,6 +237,8 @@ Trace 定位：第 1-3 轮 task_execute 输出均在 500+ tokens，Agent 一直�
 | 向量库 | Chroma |
 | Web 检索 | Tavily |
 | Web 界面 | Streamlit |
+| REST API | FastAPI + Uvicorn |
+| 容器化 | Docker |
 | 可观测性 | LangSmith |
 | PDF 解析 | PyPDFLoader |
 | Markdown 解析 | TextLoader |
@@ -241,15 +273,15 @@ LANGSMITH_API_KEY=your_key
 python build_kb.py
 ```
 
-### 8.3 运行方式
+### 8.3 三种运行方式
 
-方式一：命令行运行
+**方式一：命令行运行**
 
 ```bash
 python graph_agent_skeleton.py
 ```
 
-方式二：Web 界面（推荐）
+**方式二：Web 界面（推荐）**
 
 ```bash
 streamlit run app.py
@@ -257,18 +289,35 @@ streamlit run app.py
 
 浏览器打开 http://localhost:8501
 
-方式三：批量评估
+**方式三：REST API**
+
+```bash
+uvicorn api:api --host 0.0.0.0 --port 8000
+```
+
+访问 http://localhost:8000/docs 查看接口文档。
+
+**方式四：Docker 部署**
+
+```bash
+docker build -t mes-agent:latest .
+docker run -p 8000:8000 --env-file .env mes-agent:latest
+```
+
+### 8.4 批量评估
 
 ```bash
 python eval_agent.py
 ```
 
-### 8.4 目录结构
+### 8.5 目录结构
 
 ```
 langgraph-mes-business-agent/
 ├── graph_agent_skeleton.py    # Agent 主程序
 ├── app.py                     # Streamlit Web 界面
+├── api.py                     # FastAPI 服务
+├── Dockerfile                 # Docker 部署
 ├── eval_agent.py              # 批量评估脚本
 ├── build_kb.py                # 知识库构建脚本
 ├── pdf_docs/                  # PDF 规范文档
@@ -276,6 +325,7 @@ langgraph-mes-business-agent/
 ├── screenshots/               # 项目截图
 ├── docs/                      # 输出示例
 ├── .streamlit/                # Streamlit 配置
+├── audit.log                  # 审计日志（运行时生成）
 └── README.md
 ```
 
@@ -284,10 +334,10 @@ langgraph-mes-business-agent/
 ## 九、后续规划
 
 - 引入 Rerank 进一步提升 RAG 召回质量
-- 支持多轮对话（引入 Checkpointer 与 thread_id）
-- 增加权限控制（角色矩阵 + 工具校验）
+- 支持多会话隔离（基于 thread_id）
+- 对接真实 MES API 接口
+- 增加 Prometheus 监控指标
 - 扩充知识库至 50+ 份文档
-- 增加 GraphRAG 实验
 
 ---
 
