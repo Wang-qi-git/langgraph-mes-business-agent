@@ -10,7 +10,6 @@ import uuid
 import json
 import re
 import hashlib
-import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
 from langchain_chroma import Chroma
@@ -43,11 +42,11 @@ PRICE_OUT = 0.0028
 AUTO_APPROVE_SEARCH = os.getenv("AUTO_APPROVE_SEARCH", "false").lower() == "true"
 
 # 日志轮转配置
-LOG_MAX_MB = 10        # 单个日志文件最大 10MB
-LOG_BACKUPS = 3        # 保留 3 个备份
+LOG_MAX_MB = 10
+LOG_BACKUPS = 3
 
 # 答案缓存配置
-CACHE_MAX_SIZE = 500   # 最多缓存 500 条答案
+CACHE_MAX_SIZE = 500
 
 # LLM 与工具初始化
 llm = ChatOpenAI(
@@ -99,19 +98,16 @@ class AgentTraceHandler(BaseCallbackHandler):
 
 # ====================== 日志轮转 ======================
 def _rotate_if_needed(path: str, max_mb: int = LOG_MAX_MB, backups: int = LOG_BACKUPS):
-    """日志文件超过 max_mb 时轮转：path -> path.1 -> path.2 -> ... -> path.N"""
     if not os.path.exists(path):
         return
     if os.path.getsize(path) / (1024 * 1024) < max_mb:
         return
-    # 删除最旧的备份
     oldest = f"{path}.{backups}"
     if os.path.exists(oldest):
         try:
             os.remove(oldest)
         except Exception:
             pass
-    # 逐个重命名：path.N-1 -> path.N
     for i in range(backups - 1, 0, -1):
         src = f"{path}.{i}"
         dst = f"{path}.{i+1}"
@@ -120,7 +116,6 @@ def _rotate_if_needed(path: str, max_mb: int = LOG_MAX_MB, backups: int = LOG_BA
                 os.rename(src, dst)
             except Exception:
                 pass
-    # path -> path.1
     try:
         os.rename(path, f"{path}.1")
         print(f"【日志轮转】{path} -> {path}.1（超过 {max_mb}MB）")
@@ -133,7 +128,6 @@ _ANSWER_CACHE = LRUCache(maxsize=CACHE_MAX_SIZE)
 
 
 def _cache_key(query: str, user_role: str) -> str:
-    """缓存 key：user_role + query 的 MD5。角色不同不共享缓存（权限不同）"""
     return hashlib.md5(f"{user_role}::{query.strip()}".encode("utf-8")).hexdigest()
 
 
@@ -175,7 +169,7 @@ def print_token_usage(resp):
 # ========== 模型缓存（模块级全局） ==========
 _GLOBAL_VECTOR_DB = None
 _GLOBAL_RERANKER = None
-_RERANKER_FAILED = False    # Reranker 加载失败的永久标记
+_RERANKER_FAILED = False
 
 
 def _get_vector_db():
@@ -195,10 +189,6 @@ def _get_vector_db():
 
 
 def get_reranker():
-    """Reranker 加载（带失败降级）
-    - 加载失败后永久标记 _RERANKER_FAILED=True，避免反复尝试拖慢请求
-    - 返回 None 表示不可用，调用方需降级
-    """
     global _GLOBAL_RERANKER, _RERANKER_FAILED
     if _RERANKER_FAILED:
         return None
@@ -218,11 +208,10 @@ def get_reranker():
     return _GLOBAL_RERANKER
 
 
-# RAG 检索（粗召回 + Rerank 精排，带完整降级）
 def chroma_search(query: str) -> tuple[str, list]:
+    """深度模式专用：粗召回 10 + Reranker 精排 3，带三级降级"""
     vector_db = _get_vector_db()
 
-    # ========== 第一步：粗召回 ==========
     try:
         docs = vector_db.similarity_search(query, k=10)
     except Exception as e:
@@ -234,12 +223,10 @@ def chroma_search(query: str) -> tuple[str, list]:
     if not docs:
         return "", []
 
-    # ========== 第二步：Rerank 精排（三级降级） ==========
     top_docs = None
     reranker = get_reranker()
 
     if reranker is not None:
-        # 一级：正常 Rerank
         try:
             pairs = [[query, doc.page_content] for doc in docs]
             scores = reranker.compute_score(pairs)
@@ -254,7 +241,6 @@ def chroma_search(query: str) -> tuple[str, list]:
             })
             print(f"【Rerank】精排完成，{len(docs)} -> {len(top_docs)}")
         except Exception as e:
-            # 二级：Rerank 推理异常，降级到向量 Top-K
             print(f"【Rerank 推理异常】降级为向量 Top-{CHROMA_TOP_K}：{e}")
             write_trace_log({
                 "level": "error",
@@ -264,7 +250,6 @@ def chroma_search(query: str) -> tuple[str, list]:
             })
             top_docs = docs[:CHROMA_TOP_K]
     else:
-        # 三级：Reranker 完全不可用，直接向量 Top-K
         print(f"【Rerank 降级】Reranker 不可用，使用向量 Top-{CHROMA_TOP_K}")
         write_trace_log({
             "level": "warning",
@@ -423,6 +408,63 @@ def write_audit_log(entry: dict):
 def check_permission(user_role: str, tool_name: str) -> bool:
     allowed = ROLE_PERMISSIONS.get(user_role, [])
     return tool_name in allowed
+
+
+# ====================== 快速模式 MES 意图识别 ======================
+_MES_INTENT_PATTERNS = {
+    "mes_low_stock":       [r"低于安全库存", r"低库存", r"库存不足", r"要补货", r"缺料"],
+    "mes_alarm_equipment": [r"设备报警", r"设备异常", r"报警的设备", r"维护中", r"故障设备"],
+    "mes_quality_issues":  [r"质量问题", r"异常批次", r"质量异常", r"质量事故"],
+    "mes_work_order":      [r"WO-\d", r"工单.{0,5}(状态|进度|情况)", r"工单号"],
+    "mes_inventory":       [r"SKU-[\w-]+", r"库存.{0,5}多少", r"物料.{0,5}(还有|剩余)"],
+    "mes_equipment":       [r"M-\d+", r"设备.{0,5}(状态|情况)"],
+}
+
+_MES_NO_ARG_TOOLS = {"mes_low_stock", "mes_alarm_equipment", "mes_quality_issues"}
+
+
+def detect_mes_intent(query: str) -> tuple[str, str]:
+    """快速识别 MES 意图。返回 (tool_name, tool_query)，无匹配返回 ("", "")"""
+    for tool_name, patterns in _MES_INTENT_PATTERNS.items():
+        for p in patterns:
+            if re.search(p, query, re.IGNORECASE):
+                tool_q = ""
+                if tool_name == "mes_work_order":
+                    m = re.search(r"WO-[\w-]+", query, re.IGNORECASE)
+                    if m:
+                        tool_q = m.group(0).upper()
+                elif tool_name == "mes_inventory":
+                    m = re.search(r"SKU-[\w-]+", query, re.IGNORECASE)
+                    if m:
+                        tool_q = m.group(0).upper()
+                elif tool_name == "mes_equipment":
+                    m = re.search(r"M-\d+", query, re.IGNORECASE)
+                    if m:
+                        tool_q = m.group(0).upper()
+                return tool_name, tool_q
+    return "", ""
+
+
+def _quick_mes_context(query: str, user_role: str) -> str:
+    """快速模式下按需调 MES 工具，返回额外上下文"""
+    tool_name, tool_q = detect_mes_intent(query)
+    if not tool_name:
+        return ""
+    if not check_permission(user_role, tool_name):
+        return ""
+    try:
+        func = mes_tools.MES_TOOLS[tool_name]
+        if tool_name in _MES_NO_ARG_TOOLS:
+            result = func()
+        elif tool_q:
+            result = func(tool_q)
+        else:
+            return ""
+        print(f"【快速模式-MES】{tool_name}({tool_q}) 已调用")
+        return result
+    except Exception as e:
+        print(f"【快速模式-MES】{tool_name} 调用失败：{e}")
+        return ""
 
 
 # ========== 5 个 Prompt 模板 ==========
@@ -680,7 +722,7 @@ def tool_exec_node(state: AgentState):
             print(skip_msg)
             think_trace = state["think_trace"][-TRACE_MAX_ITEMS:] + [skip_msg]
             write_trace_log({"node": "tool_exec_node", "trace_info": skip_msg})
-            return {"think_trace": think_trace}
+            return {"think_trace": skip_msg}
 
         block_message = check_bom_version_guard(tool_q, state.get("user_query", ""))
         if block_message:
@@ -706,7 +748,7 @@ def tool_exec_node(state: AgentState):
     elif curr["tool_name"] in mes_tools.MES_TOOLS:
         try:
             mes_func = mes_tools.MES_TOOLS[curr["tool_name"]]
-            if curr["tool_name"] in ("mes_low_stock", "mes_alarm_equipment", "mes_quality_issues"):
+            if curr["tool_name"] in _MES_NO_ARG_TOOLS:
                 mes_result = mes_func()
             else:
                 if not tool_q:
@@ -730,7 +772,6 @@ def tool_exec_node(state: AgentState):
         except Exception as e:
             err_msg = f"【MES 工具异常】{curr['tool_name']}: {str(e)}"
             print(err_msg)
-            # 降级：给 LLM 一个提示，避免编造
             new_local_kb += f"\n【MES 系统暂时不可用】{curr['tool_name']} 查询失败，请基于现有信息回答，不要编造实时数据。"
             obs_list.append(err_msg)
             write_trace_log({"level": "error", "node": "tool_exec_node", "msg": err_msg})
@@ -1080,7 +1121,6 @@ app = builder.compile()
 _global_warmup_done = False
 
 def _warmup_models():
-    """加载模型 + 真跑一次检索，消除所有首次调用开销"""
     global _global_warmup_done
     if _global_warmup_done:
         return
@@ -1090,8 +1130,6 @@ def _warmup_models():
         _t0 = _time.time()
 
         _ = _get_vector_db()
-
-        # Reranker 可能失败，不阻塞主流程
         _ = get_reranker()
 
         print("【模块预热】执行一次真实检索（消除首次调用开销）...")
@@ -1120,7 +1158,6 @@ NODE_LABELS = {
 PROGRESS_PREFIX = "[PROGRESS]"
 
 
-# ---------- 深度模式（六节点工作流，异步流式） ----------
 async def stream_agent(user_query: str, case_id: str = "stream", user_role: str = "admin"):
     """深度模式：六节点 Reflection Loop，带进度反馈 + 正文流式"""
     init_state: AgentState = {
@@ -1161,7 +1198,7 @@ async def stream_agent(user_query: str, case_id: str = "stream", user_role: str 
                 yield chunk.content
 
 
-# ---------- 快速模式（RAG + 单次 LLM，带缓存） ----------
+# ---------- 快速模式（RAG + MES 意图识别 + 单次 LLM，带缓存） ----------
 QUICK_PROMPT = """你是制造业MES业务专家。基于下面的参考资料回答用户问题。
 
 【硬性要求】
@@ -1169,6 +1206,7 @@ QUICK_PROMPT = """你是制造业MES业务专家。基于下面的参考资料�
 - 直接给结论和要点，不要铺垫、不要"综上所述"
 - 用 2~4 个小节或 3~5 个要点，Markdown 格式
 - 不要重复问题，不要写"根据参考资料"
+- 若参考资料标注为"MES 实时数据"，请据此回答，不要编造
 
 参考资料：
 {kb_ctx}
@@ -1179,60 +1217,73 @@ QUICK_PROMPT = """你是制造业MES业务专家。基于下面的参考资料�
 
 
 def quick_answer(user_query: str, user_role: str = "admin") -> str:
-    """快速模式（非流式）：RAG + 单次 LLM，同步返回完整答案。带缓存。"""
-    # 1. 尝试命中缓存
+    """快速模式（非流式）：向量 Top-2 + MES 意图识别 + 单次 LLM，带缓存。"""
+    # 1. 缓存
     cached = _cache_get(user_query, user_role)
     if cached is not None:
         print(f"【缓存命中】{user_query[:30]}...")
         return cached
 
-    # 2. 未命中：走完整流程
+    # 2. 向量检索 Top-2（跳过 Reranker）
+    kb_ctx = ""
     try:
-        kb_ctx, _ = chroma_search(user_query)
+        vector_db = _get_vector_db()
+        docs = vector_db.similarity_search(user_query, k=2)
+        kb_ctx = "\n\n".join([d.page_content for d in docs])
     except Exception as e:
         print(f"【快速模式】检索异常：{e}")
-        kb_ctx = ""
+
+    # 3. MES 意图识别（零延迟正则）
+    mes_ctx = _quick_mes_context(user_query, user_role)
+    if mes_ctx:
+        kb_ctx = f"【MES 实时数据】\n{mes_ctx}\n\n【知识库片段】\n{kb_ctx}"
 
     if not kb_ctx:
         kb_ctx = "（无参考资料，基于你的领域知识回答）"
 
-    prompt = QUICK_PROMPT.replace("{kb_ctx}", kb_ctx[:800]).replace("{user_query}", user_query)
+    prompt = QUICK_PROMPT.replace("{kb_ctx}", kb_ctx[:1500]).replace("{user_query}", user_query)
     resp = llm.invoke(prompt)
 
-    # 3. 写入缓存
     _cache_set(user_query, user_role, resp.content)
     return resp.content
 
 
 def quick_answer_stream(user_query: str, user_role: str = "admin"):
-    """快速模式（流式）：RAG + 单次 LLM，同步流式 yield token。带缓存。"""
-    # 1. 尝试命中缓存
+    """快速模式（流式）：向量 Top-2 + MES 意图识别 + 单次 LLM 流式，带缓存。"""
+    # 1. 缓存
     cached = _cache_get(user_query, user_role)
     if cached is not None:
         print(f"【缓存命中-流式】{user_query[:30]}...")
         yield cached
         return
 
-    # 2. 未命中：走完整流程
+    # 2. 向量检索 Top-2
+    kb_ctx = ""
     try:
-        kb_ctx, _ = chroma_search(user_query)
+        vector_db = _get_vector_db()
+        docs = vector_db.similarity_search(user_query, k=2)
+        kb_ctx = "\n\n".join([d.page_content for d in docs])
     except Exception as e:
         print(f"【快速流式】检索异常：{e}")
-        kb_ctx = ""
+
+    # 3. MES 意图识别
+    mes_ctx = _quick_mes_context(user_query, user_role)
+    if mes_ctx:
+        kb_ctx = f"【MES 实时数据】\n{mes_ctx}\n\n【知识库片段】\n{kb_ctx}"
 
     if not kb_ctx:
         kb_ctx = "（无参考资料，基于你的领域知识回答）"
 
-    prompt = QUICK_PROMPT.replace("{kb_ctx}", kb_ctx[:800]).replace("{user_query}", user_query)
+    prompt = QUICK_PROMPT.replace("{kb_ctx}", kb_ctx[:1500]).replace("{user_query}", user_query)
 
-    # 3. 流式输出，同时累积答案
+    # 4. 流式输出 + 累积答案
     full_answer = ""
     for chunk in llm.stream(prompt):
         if hasattr(chunk, "content") and chunk.content:
             full_answer += chunk.content
             yield chunk.content
 
-    # 4. 流式结束写入缓存
+    # 5. 写入缓存
     if full_answer:
         _cache_set(user_query, user_role, full_answer)
 # ========== 流式输出辅助函数结束 ==========
@@ -1240,7 +1291,6 @@ def quick_answer_stream(user_query: str, user_role: str = "admin"):
 
 # ====================== 缓存统计入口 ======================
 def get_cache_stats() -> dict:
-    """查看缓存状态（供 API/CLI 调用）"""
     return _cache_stats()
 
 

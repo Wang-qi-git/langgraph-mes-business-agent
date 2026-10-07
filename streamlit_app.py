@@ -1,12 +1,9 @@
 """
-MES 业务分析 Agent - Streamlit 前端
-支持多会话隔离（URL 带 session_id，刷新不丢）
-运行：streamlit run streamlit_app.py
+MES 业务分析 Agent - Streamlit 前端（v5.0 带 JWT 登录）
 """
 import streamlit as st
 import requests
 import time
-import uuid
 from datetime import datetime
 
 API_BASE = "http://127.0.0.1:8000"
@@ -23,33 +20,28 @@ st.markdown("""
     .main-title { font-size: 2.2em; font-weight: bold; color: #2c3e50; }
     .sub-title { font-size: 1em; color: #7f8c8d; margin-bottom: 1.5em; }
     .session-tag {
-        display: inline-block;
-        background: #e3f2fd;
-        color: #1565c0;
-        padding: 2px 8px;
-        border-radius: 4px;
-        font-family: monospace;
-        font-size: 0.85em;
+        display: inline-block; background: #e3f2fd; color: #1565c0;
+        padding: 2px 8px; border-radius: 4px; font-family: monospace; font-size: 0.85em;
+    }
+    .user-card {
+        background: #f8f9fa; padding: 10px 12px; border-radius: 8px;
+        border-left: 4px solid #4caf50; margin-bottom: 10px;
     }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ==================== URL 参数工具（兼容新旧 Streamlit） ====================
+# ==================== URL 参数工具 ====================
 def get_query_param(key: str, default=None):
-    """读取 URL query 参数（兼容新旧 API）"""
     try:
-        # Streamlit >= 1.30
         val = st.query_params.get(key)
         return val if val else default
     except Exception:
-        # 老版本
         params = st.experimental_get_query_params()
         return params.get(key, [default])[0]
 
 
 def set_query_param(key: str, value: str):
-    """写入 URL query 参数"""
     try:
         st.query_params[key] = value
     except Exception:
@@ -58,7 +50,12 @@ def set_query_param(key: str, value: str):
         st.experimental_set_query_params(**params)
 
 
-# ==================== 后端调用 ====================
+# ==================== API 调用 ====================
+def _headers() -> dict:
+    token = st.session_state.get("token")
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 def check_backend() -> bool:
     try:
         return requests.get(f"{API_BASE}/health", timeout=2).status_code == 200
@@ -66,15 +63,32 @@ def check_backend() -> bool:
         return False
 
 
+def do_login(username: str, password: str):
+    try:
+        r = requests.post(
+            f"{API_BASE}/auth/login",
+            json={"username": username, "password": password},
+            timeout=5,
+        )
+        if r.status_code == 200:
+            return r.json()
+        return None
+    except Exception:
+        return None
+
+
 def create_new_session() -> str:
-    r = requests.post(f"{API_BASE}/session/new", timeout=5)
+    r = requests.post(f"{API_BASE}/session/new", headers=_headers(), timeout=5)
+    if r.status_code == 401:
+        st.session_state.token = None
+        st.rerun()
     r.raise_for_status()
     return r.json()["session_id"]
 
 
 def load_history(sid: str) -> list[dict]:
     try:
-        r = requests.get(f"{API_BASE}/session/{sid}/messages", timeout=5)
+        r = requests.get(f"{API_BASE}/session/{sid}/messages", headers=_headers(), timeout=5)
         if r.status_code == 200:
             return r.json()["messages"]
     except Exception:
@@ -84,19 +98,23 @@ def load_history(sid: str) -> list[dict]:
 
 def clear_history(sid: str):
     try:
-        requests.post(f"{API_BASE}/session/{sid}/clear", timeout=5)
+        requests.post(f"{API_BASE}/session/{sid}/clear", headers=_headers(), timeout=5)
     except Exception:
         pass
 
 
-def stream_from_api(query: str, sid: str, user_role: str):
+def stream_from_api(query: str, sid: str):
     """SSE 流式读取"""
     with requests.post(
         f"{API_BASE}/quick/stream",
-        json={"query": query, "session_id": sid, "user_role": user_role},
+        json={"query": query, "session_id": sid},
+        headers=_headers(),
         stream=True,
         timeout=120,
     ) as r:
+        if r.status_code == 401:
+            st.session_state.token = None
+            st.rerun()
         r.raise_for_status()
         for line in r.iter_lines():
             if not line:
@@ -112,21 +130,59 @@ def stream_from_api(query: str, sid: str, user_role: str):
             yield content.replace("\\n", "\n")
 
 
-# ==================== 会话初始化 ====================
-# 从 URL 读 sid，没有就创建
+# ==================== 会话状态初始化 ====================
+if "token" not in st.session_state:
+    st.session_state.token = None
+if "user_info" not in st.session_state:
+    st.session_state.user_info = None
 if "session_id" not in st.session_state:
-    existing_sid = get_query_param("sid")
-    if existing_sid:
-        st.session_state.session_id = existing_sid
-    else:
-        # 等后端就绪后再创建（第一次可能是离线）
-        st.session_state.session_id = None
-
+    st.session_state.session_id = None
 if "messages" not in st.session_state:
     st.session_state.messages = []
-
 if "pending_query" not in st.session_state:
     st.session_state.pending_query = None
+
+
+# ==================== 登录页 ====================
+if st.session_state.token is None:
+    st.markdown("<h1 style='text-align:center;'>🏭 MES 业务分析 Agent</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align:center; color:#7f8c8d;'>请登录后使用</p>", unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        if not check_backend():
+            st.error("❌ 后端服务未启动，请先运行：\n`uvicorn api_server:api --port 8000`")
+            st.stop()
+
+        with st.form("login_form"):
+            st.markdown("### 登录")
+            username = st.text_input("用户名")
+            password = st.text_input("密码", type="password")
+            submitted = st.form_submit_button("登录", use_container_width=True)
+
+            if submitted:
+                if not username or not password:
+                    st.warning("请输入用户名和密码")
+                else:
+                    info = do_login(username, password)
+                    if info:
+                        st.session_state.token = info["access_token"]
+                        st.session_state.user_info = {
+                            "username": info["username"],
+                            "role": info["role"],
+                            "name": info["name"],
+                        }
+                        st.rerun()
+                    else:
+                        st.error("用户名或密码错误")
+
+        st.caption("**演示账号**：operator / op123　　supervisor / sup123　　admin / admin123")
+    st.stop()
+
+
+# ==================== 已登录：主界面 ====================
+user_info = st.session_state.user_info
+backend_ok = check_backend()
 
 
 # ==================== 侧边栏 ====================
@@ -135,26 +191,39 @@ with st.sidebar:
     st.markdown("基于 LangGraph 的制造业 MES 领域智能助手")
     st.divider()
 
-    backend_ok = check_backend()
+    # 用户信息卡
+    st.markdown(
+        f'<div class="user-card">'
+        f'👤 <b>{user_info["name"]}</b><br>'
+        f'<span style="color:#666;font-size:0.9em;">角色：{user_info["role"]}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    if st.button("🚪 退出登录", use_container_width=True):
+        st.session_state.token = None
+        st.session_state.user_info = None
+        st.session_state.session_id = None
+        st.session_state.messages = []
+        st.rerun()
+
+    st.divider()
 
     if backend_ok:
         st.success("✅ 后端服务在线")
-        # 确保有 session_id
         if st.session_state.session_id is None:
             st.session_state.session_id = create_new_session()
             set_query_param("sid", st.session_state.session_id)
             st.session_state.messages = []
             st.rerun()
     else:
-        st.error("❌ 后端服务离线\n\n请先启动：\n`uvicorn api_server:api --port 8000`")
+        st.error("❌ 后端服务离线")
 
-    # 显示当前会话 ID
     if st.session_state.session_id:
         st.markdown(
             f'当前会话：<span class="session-tag">{st.session_state.session_id}</span>',
             unsafe_allow_html=True,
         )
-
         col1, col2 = st.columns(2)
         with col1:
             if st.button("🆕 新会话", use_container_width=True):
@@ -186,22 +255,16 @@ with st.sidebar:
     examples = [
         "什么是MES系统中的工单管理？",
         "简述8D报告D4根本原因分析有哪些要求？",
-        "SPC统计过程控制的基本原理是什么？",
-        "设备故障排查的一般步骤？",
-        "如何降低生产过程中的不良率？",
+        "工单 WO-20261007-001 现在什么状态？",
+        "哪些物料低于安全库存？",
+        "现在有哪些设备报警？",
     ]
     for ex in examples:
         if st.button(ex, key=f"ex_{ex}", use_container_width=True):
             st.session_state.pending_query = ex
 
-    st.divider()
-
-    st.markdown("#### 👤 用户角色")
-    user_role = st.selectbox("选择角色", ["operator", "supervisor", "admin"], index=2)
-
 
 # ==================== 首次加载历史 ====================
-# 如果本地 messages 为空但 session_id 存在，从后端加载（刷新恢复）
 if (
     st.session_state.session_id
     and not st.session_state.messages
@@ -218,18 +281,14 @@ if (
 # ==================== 主区域 ====================
 st.markdown('<div class="main-title">🏭 MES 业务分析 Agent</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="sub-title">多会话隔离 · 刷新不丢 · 快速 1s / 深度 60s</div>',
+    '<div class="sub-title">JWT 认证 · 多会话隔离 · 快速 1s / 深度 60s</div>',
     unsafe_allow_html=True,
 )
 
-
-# ==================== 渲染历史 ====================
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"], avatar="🧑" if msg["role"] == "user" else "🤖"):
         st.markdown(msg["content"])
 
-
-# ==================== 输入框 ====================
 user_input = st.chat_input("请输入 MES 相关问题...")
 
 if st.session_state.pending_query:
@@ -240,14 +299,13 @@ if st.session_state.pending_query:
 # ==================== 处理输入 ====================
 if user_input:
     if not backend_ok:
-        st.error("❌ 后端服务未启动，请先运行：`uvicorn api_server:api --port 8000`")
+        st.error("❌ 后端服务未启动")
         st.stop()
 
     if not st.session_state.session_id:
         st.error("❌ 会话未初始化，请刷新页面")
         st.stop()
 
-    # 显示用户消息
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user", avatar="🧑"):
         st.markdown(user_input)
@@ -256,7 +314,6 @@ if user_input:
         mode_label = "快速" if is_quick else "深度"
 
         if is_quick:
-            # 快速模式 SSE
             status_ph = st.empty()
             ans_ph = st.empty()
             status_ph.info("⏳ 正在检索并生成...")
@@ -266,11 +323,7 @@ if user_input:
             first_ts = None
 
             try:
-                for chunk in stream_from_api(
-                    user_input,
-                    st.session_state.session_id,
-                    user_role,
-                ):
+                for chunk in stream_from_api(user_input, st.session_state.session_id):
                     if first_ts is None:
                         first_ts = time.time()
                         status_ph.success(f"⏳ 首字 {first_ts - start:.2f}s...")
@@ -298,19 +351,18 @@ if user_input:
                 status_ph.error(f"❌ 失败：{str(e)}")
 
         else:
-            # 深度模式
             with st.spinner("⏳ 深度分析中（六节点工作流，约 40~60s）..."):
                 try:
                     start = time.time()
                     r = requests.post(
                         f"{API_BASE}/deep",
-                        json={
-                            "query": user_input,
-                            "session_id": st.session_state.session_id,
-                            "user_role": user_role,
-                        },
+                        json={"query": user_input, "session_id": st.session_state.session_id},
+                        headers=_headers(),
                         timeout=180,
                     )
+                    if r.status_code == 401:
+                        st.session_state.token = None
+                        st.rerun()
                     elapsed = time.time() - start
 
                     if r.status_code == 200:
@@ -338,4 +390,4 @@ if user_input:
 
 
 st.divider()
-st.caption("⚡ Powered by LangGraph + DeepSeek + BGE + Chroma · 会话隔离已启用")
+st.caption("🔐 JWT 认证 · ⚡ Powered by LangGraph + DeepSeek + BGE + Chroma")
