@@ -21,6 +21,8 @@
 - [快速开始](#-快速开始)
 - [项目结构](#-项目结构)
 - [后续规划](#-后续规划)
+- | 会话存储 | SQLite | 轻量、零依赖 |
+多会话隔离：URL-based session + SQLite 持久化，刷新不丢、多标签独立
 
 ---
 
@@ -349,7 +351,6 @@ langgraph-mes-business-agent/
 
 后续规划
 短期（1~2 周）
-□ 多会话隔离：引入 LangGraph checkpointer + Postgres，支持 thread_id
 □ 快速模式 API 鉴权：FastAPI 加 JWT 或 API Key 校验
 □ 前端体验优化：增加"继续追问"、"复制答案"等交互
 中期（1 个月）

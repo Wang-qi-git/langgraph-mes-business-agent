@@ -1,15 +1,15 @@
 """
-MES 业务分析 Agent - Streamlit 前端（调 FastAPI 后端）
+MES 业务分析 Agent - Streamlit 前端
+支持多会话隔离（URL 带 session_id，刷新不丢）
 运行：streamlit run streamlit_app.py
 """
 import streamlit as st
 import requests
 import time
+import uuid
 from datetime import datetime
 
-# ⚠️ 必须用 127.0.0.1，不要用 localhost（Windows 上会走 IPv6 超时）
 API_BASE = "http://127.0.0.1:8000"
-
 
 st.set_page_config(
     page_title="MES 业务分析 Agent",
@@ -22,34 +22,78 @@ st.markdown("""
 <style>
     .main-title { font-size: 2.2em; font-weight: bold; color: #2c3e50; }
     .sub-title { font-size: 1em; color: #7f8c8d; margin-bottom: 1.5em; }
+    .session-tag {
+        display: inline-block;
+        background: #e3f2fd;
+        color: #1565c0;
+        padding: 2px 8px;
+        border-radius: 4px;
+        font-family: monospace;
+        font-size: 0.85em;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ==================== 工具函数 ====================
+# ==================== URL 参数工具（兼容新旧 Streamlit） ====================
+def get_query_param(key: str, default=None):
+    """读取 URL query 参数（兼容新旧 API）"""
+    try:
+        # Streamlit >= 1.30
+        val = st.query_params.get(key)
+        return val if val else default
+    except Exception:
+        # 老版本
+        params = st.experimental_get_query_params()
+        return params.get(key, [default])[0]
+
+
+def set_query_param(key: str, value: str):
+    """写入 URL query 参数"""
+    try:
+        st.query_params[key] = value
+    except Exception:
+        params = st.experimental_get_query_params()
+        params[key] = value
+        st.experimental_set_query_params(**params)
+
+
+# ==================== 后端调用 ====================
 def check_backend() -> bool:
     try:
-        r = requests.get(f"{API_BASE}/health", timeout=2)
-        return r.status_code == 200
+        return requests.get(f"{API_BASE}/health", timeout=2).status_code == 200
     except Exception:
         return False
 
 
-def needs_context(query: str) -> bool:
-    pronouns = ["它", "他", "她", "这个", "那个", "这些", "那些", "该", "此", "上述", "刚才", "之前"]
-    followup = ["详细说说", "展开", "继续", "还有呢", "然后呢", "举个例子", "再说说"]
-    if len(query) < 20 and any(p in query for p in pronouns):
-        return True
-    if len(query) < 15 and any(f in query for f in followup):
-        return True
-    return False
+def create_new_session() -> str:
+    r = requests.post(f"{API_BASE}/session/new", timeout=5)
+    r.raise_for_status()
+    return r.json()["session_id"]
 
 
-def stream_from_api(query: str, user_role: str):
-    """从 FastAPI SSE 端点流式读取 token"""
+def load_history(sid: str) -> list[dict]:
+    try:
+        r = requests.get(f"{API_BASE}/session/{sid}/messages", timeout=5)
+        if r.status_code == 200:
+            return r.json()["messages"]
+    except Exception:
+        pass
+    return []
+
+
+def clear_history(sid: str):
+    try:
+        requests.post(f"{API_BASE}/session/{sid}/clear", timeout=5)
+    except Exception:
+        pass
+
+
+def stream_from_api(query: str, sid: str, user_role: str):
+    """SSE 流式读取"""
     with requests.post(
         f"{API_BASE}/quick/stream",
-        json={"query": query, "user_role": user_role},
+        json={"query": query, "session_id": sid, "user_role": user_role},
         stream=True,
         timeout=120,
     ) as r:
@@ -65,9 +109,24 @@ def stream_from_api(query: str, user_role: str):
                 break
             if content.startswith("[ERROR]"):
                 raise RuntimeError(content[7:].strip())
-            # 还原被转义的换行
-            content = content.replace("\\n", "\n")
-            yield content
+            yield content.replace("\\n", "\n")
+
+
+# ==================== 会话初始化 ====================
+# 从 URL 读 sid，没有就创建
+if "session_id" not in st.session_state:
+    existing_sid = get_query_param("sid")
+    if existing_sid:
+        st.session_state.session_id = existing_sid
+    else:
+        # 等后端就绪后再创建（第一次可能是离线）
+        st.session_state.session_id = None
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "pending_query" not in st.session_state:
+    st.session_state.pending_query = None
 
 
 # ==================== 侧边栏 ====================
@@ -76,17 +135,46 @@ with st.sidebar:
     st.markdown("基于 LangGraph 的制造业 MES 领域智能助手")
     st.divider()
 
-    if check_backend():
+    backend_ok = check_backend()
+
+    if backend_ok:
         st.success("✅ 后端服务在线")
+        # 确保有 session_id
+        if st.session_state.session_id is None:
+            st.session_state.session_id = create_new_session()
+            set_query_param("sid", st.session_state.session_id)
+            st.session_state.messages = []
+            st.rerun()
     else:
         st.error("❌ 后端服务离线\n\n请先启动：\n`uvicorn api_server:api --port 8000`")
+
+    # 显示当前会话 ID
+    if st.session_state.session_id:
+        st.markdown(
+            f'当前会话：<span class="session-tag">{st.session_state.session_id}</span>',
+            unsafe_allow_html=True,
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🆕 新会话", use_container_width=True):
+                new_sid = create_new_session()
+                st.session_state.session_id = new_sid
+                set_query_param("sid", new_sid)
+                st.session_state.messages = []
+                st.rerun()
+        with col2:
+            if st.button("🗑️ 清空", use_container_width=True):
+                clear_history(st.session_state.session_id)
+                st.session_state.messages = []
+                st.rerun()
 
     st.divider()
 
     st.markdown("#### ⚡ 回答模式")
     mode = st.radio(
         "选择模式",
-        ["⚡ 快速模式（流式，首字 2~3s）", "🔍 深度模式（40~60s）"],
+        ["⚡ 快速模式（1~3s）", "🔍 深度模式（40~60s）"],
         index=0,
         label_visibility="collapsed",
     )
@@ -108,40 +196,40 @@ with st.sidebar:
 
     st.divider()
 
-    if st.button("🗑️ 清空对话", use_container_width=True):
-        st.session_state.messages = []
-        st.rerun()
-
-    st.divider()
-
     st.markdown("#### 👤 用户角色")
     user_role = st.selectbox("选择角色", ["operator", "supervisor", "admin"], index=2)
 
 
+# ==================== 首次加载历史 ====================
+# 如果本地 messages 为空但 session_id 存在，从后端加载（刷新恢复）
+if (
+    st.session_state.session_id
+    and not st.session_state.messages
+    and backend_ok
+):
+    history = load_history(st.session_state.session_id)
+    if history:
+        st.session_state.messages = [
+            {"role": m["role"], "content": m["content"]}
+            for m in history
+        ]
+
+
 # ==================== 主区域 ====================
 st.markdown('<div class="main-title">🏭 MES 业务分析 Agent</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">快速模式流式输出，深度模式输出结构化长报告</div>', unsafe_allow_html=True)
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "pending_query" not in st.session_state:
-    st.session_state.pending_query = None
+st.markdown(
+    '<div class="sub-title">多会话隔离 · 刷新不丢 · 快速 1s / 深度 60s</div>',
+    unsafe_allow_html=True,
+)
 
 
 # ==================== 渲染历史 ====================
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"], avatar="🧑" if msg["role"] == "user" else "🤖"):
         st.markdown(msg["content"])
-        if msg.get("meta"):
-            with st.expander("📊 执行详情", expanded=False):
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric("耗时", f"{msg['meta'].get('elapsed', 0):.1f}s")
-                with col2:
-                    st.metric("模式", msg['meta'].get('mode', '-'))
 
 
-# ==================== 输入 ====================
+# ==================== 输入框 ====================
 user_input = st.chat_input("请输入 MES 相关问题...")
 
 if st.session_state.pending_query:
@@ -151,53 +239,47 @@ if st.session_state.pending_query:
 
 # ==================== 处理输入 ====================
 if user_input:
-    if not check_backend():
+    if not backend_ok:
         st.error("❌ 后端服务未启动，请先运行：`uvicorn api_server:api --port 8000`")
         st.stop()
 
+    if not st.session_state.session_id:
+        st.error("❌ 会话未初始化，请刷新页面")
+        st.stop()
+
+    # 显示用户消息
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user", avatar="🧑"):
         st.markdown(user_input)
-
-    # 上下文拼接
-    if needs_context(user_input) and len(st.session_state.messages) > 1:
-        recent = st.session_state.messages[-4:-1]
-        history_text = "\n".join([
-            f"{'用户' if m['role'] == 'user' else '助手'}: {m['content'][:150]}"
-            for m in recent
-        ])
-        full_query = f"【上文】\n{history_text[:300]}\n\n【当前】\n{user_input}"
-    else:
-        full_query = user_input
 
     with st.chat_message("assistant", avatar="🤖"):
         mode_label = "快速" if is_quick else "深度"
 
         if is_quick:
-            # ============ 快速模式：SSE 流式 ============
-            status_placeholder = st.empty()
-            answer_placeholder = st.empty()
-            status_placeholder.info("⏳ 正在检索并生成...")
+            # 快速模式 SSE
+            status_ph = st.empty()
+            ans_ph = st.empty()
+            status_ph.info("⏳ 正在检索并生成...")
 
             start = time.time()
             full_answer = ""
-            first_token_ts = None
+            first_ts = None
 
             try:
-                for chunk in stream_from_api(full_query, user_role):
-                    if first_token_ts is None:
-                        first_token_ts = time.time()
-                        status_placeholder.success(
-                            f"⏳ 首字延迟 {first_token_ts - start:.2f}s（正在生成...）"
-                        )
+                for chunk in stream_from_api(
+                    user_input,
+                    st.session_state.session_id,
+                    user_role,
+                ):
+                    if first_ts is None:
+                        first_ts = time.time()
+                        status_ph.success(f"⏳ 首字 {first_ts - start:.2f}s...")
                     full_answer += chunk
-                    answer_placeholder.markdown(full_answer)
+                    ans_ph.markdown(full_answer)
 
                 elapsed = time.time() - start
-                first_lat = (first_token_ts - start) if first_token_ts else elapsed
-                status_placeholder.success(
-                    f"✅ 完成（首字 {first_lat:.2f}s / 总 {elapsed:.2f}s）"
-                )
+                first_lat = (first_ts - start) if first_ts else elapsed
+                status_ph.success(f"✅ 完成（首字 {first_lat:.2f}s / 总 {elapsed:.2f}s）")
 
                 st.download_button(
                     label="📥 下载答案 (Markdown)",
@@ -210,26 +292,29 @@ if user_input:
                 st.session_state.messages.append({
                     "role": "assistant",
                     "content": full_answer,
-                    "meta": {"elapsed": elapsed, "mode": mode_label},
                 })
 
             except Exception as e:
-                status_placeholder.error(f"❌ 失败：{str(e)}")
+                status_ph.error(f"❌ 失败：{str(e)}")
 
         else:
-            # ============ 深度模式：非流式 ============
+            # 深度模式
             with st.spinner("⏳ 深度分析中（六节点工作流，约 40~60s）..."):
                 try:
                     start = time.time()
-                    resp = requests.post(
+                    r = requests.post(
                         f"{API_BASE}/deep",
-                        json={"query": full_query, "user_role": user_role},
+                        json={
+                            "query": user_input,
+                            "session_id": st.session_state.session_id,
+                            "user_role": user_role,
+                        },
                         timeout=180,
                     )
                     elapsed = time.time() - start
 
-                    if resp.status_code == 200:
-                        data = resp.json()
+                    if r.status_code == 200:
+                        data = r.json()
                         full_answer = data["answer"]
                         st.markdown(full_answer)
                         st.success(f"✅ 深度模式完成（耗时 {elapsed:.1f}s）")
@@ -245,13 +330,12 @@ if user_input:
                         st.session_state.messages.append({
                             "role": "assistant",
                             "content": full_answer,
-                            "meta": {"elapsed": elapsed, "mode": mode_label},
                         })
                     else:
-                        st.error(f"❌ 后端错误 {resp.status_code}: {resp.text}")
+                        st.error(f"❌ 后端错误 {r.status_code}: {r.text}")
                 except Exception as e:
                     st.error(f"❌ 请求异常：{str(e)}")
 
 
 st.divider()
-st.caption("⚡ Powered by LangGraph + DeepSeek + BGE + Chroma")
+st.caption("⚡ Powered by LangGraph + DeepSeek + BGE + Chroma · 会话隔离已启用")
