@@ -18,6 +18,7 @@ from typing import TypedDict
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from tavily import TavilyClient
+import mes_tools
 
 # 加载 .env 环境变量
 load_dotenv()
@@ -300,9 +301,21 @@ class AgentState(TypedDict):
 
 # ====================== 权限矩阵 ======================
 ROLE_PERMISSIONS = {
-    "operator":   ["chroma_search"],
-    "supervisor": ["chroma_search", "tavily_search"],
-    "admin":      ["chroma_search", "tavily_search"],
+    "operator": [
+        "chroma_search",
+        "mes_work_order", "mes_inventory", "mes_equipment",
+        "mes_low_stock", "mes_alarm_equipment", "mes_quality_issues",
+    ],
+    "supervisor": [
+        "chroma_search", "tavily_search",
+        "mes_work_order", "mes_inventory", "mes_equipment",
+        "mes_low_stock", "mes_alarm_equipment", "mes_quality_issues",
+    ],
+    "admin": [
+        "chroma_search", "tavily_search",
+        "mes_work_order", "mes_inventory", "mes_equipment",
+        "mes_low_stock", "mes_alarm_equipment", "mes_quality_issues",
+    ],
 }
 
 AUDIT_LOG_FILE = "./audit.log"
@@ -340,9 +353,27 @@ TOOL_DECIDE_PROMPT = """
 已有本地知识库KB：{kb_ctx}
 已有Web：{web_ctx}
 
-工具三选一：chroma_search / tavily_search / no_tool。
-优先使用chroma_search查询本地知识库；本地无有效信息再选择tavily_search联网；已有信息足够就选no_tool，避免多余搜索。
-输出JSON：{"tool":"xxx","tool_query":"xxx"}
+【工具列表】
+- chroma_search：查本地知识库（规范、规则、SOP）
+- tavily_search：联网搜索（最新资讯、外部信息）
+- mes_work_order：查实时工单状态。tool_query 填工单号，如 WO-20261007-001
+- mes_inventory：查实时物料库存。tool_query 填 SKU 编码，如 SKU-A100-01
+- mes_equipment：查设备实时状态。tool_query 填设备编号，如 M-001
+- mes_low_stock：查所有低库存物料（无参数，tool_query 填空）
+- mes_alarm_equipment：查所有报警/维护中的设备（无参数，tool_query 填空）
+- mes_quality_issues：查处理中的质量问题（无参数，tool_query 填空）
+- no_tool：无需工具
+
+【决策原则】
+1. 问"工单现在什么状态/进度" → mes_work_order
+2. 问"库存还有多少/齐套情况" → mes_inventory；问"哪些物料要补货/低于安全库存" → mes_low_stock
+3. 问"设备是否正常/报警" → mes_equipment 或 mes_alarm_equipment
+4. 问"质量问题/异常批次" → mes_quality_issues
+5. 问"规范是什么/8D要求/SPC原理" → chroma_search
+6. 需要最新资讯 → tavily_search
+7. 已有信息足够回答 → no_tool
+
+输出 JSON：{"tool":"xxx","tool_query":"xxx"}
 """
 
 TASK_EXECUTE_PROMPT = """
@@ -350,6 +381,11 @@ TASK_EXECUTE_PROMPT = """
 任务：{task_desc}
 本地KB：{kb_ctx}
 Web：{web_ctx}
+
+【数据源措辞要求】
+- 如果素材来自【工单实时状态】【设备实时状态】【物料库存实时数据】等标记 → 这是 MES 系统实时数据，请说"根据 MES 实时数据"，不要说"根据本地知识库"
+- 如果素材来自文档片段（规范、SOP）→ 才说"根据知识库"
+- 不要混淆两个数据源
 """
 
 REFLECT_REPLAN_PROMPT = """
@@ -391,6 +427,17 @@ SUMMARY_PROMPT = """
 原始问题：{user_query}
 子任务片段：{task_output_blocks}
 基于上面内容输出完整通顺报告。
+
+【去重原则】
+- 如果多个子任务引用了同一份数据源（比如同一张工单、同一批库存），合并展示，不要重复罗列字段
+- 不要出现两个章节讲同一个数据
+- 报告结构：先给结论，再给支撑数据
+
+【数据源措辞】
+- 来自 MES 实时系统的数据，标注"实时数据"
+- 来自文档的规范/SOP，标注"知识库"
+- 不要混淆
+
 如果已有草稿可以直接复用、润色，不要完全重写。
 """
 
@@ -528,18 +575,21 @@ def tool_exec_node(state: AgentState):
         }
 
     tool_q = curr.get("tool_query", "").strip()
-    if not tool_q:
-        skip_msg = f"tool_exec：task{curr['task_id']} tool_query为空，跳过工具调用"
-        print(skip_msg)
-        think_trace = state["think_trace"][-TRACE_MAX_ITEMS:] + [skip_msg]
-        write_trace_log({"node": "tool_exec_node", "trace_info": skip_msg})
-        return {"think_trace": think_trace}
     new_local_kb = state["context_local_kb"]
     new_web = state["context_from_web"]
     obs_list = []
     tavily_cache = state["tavily_cache"].copy()
     new_ref = state.get("ref_docs", []).copy()
+
+    # ========== chroma_search ==========
     if curr["tool_name"] == "chroma_search":
+        if not tool_q:
+            skip_msg = f"tool_exec：task{curr['task_id']} tool_query为空，跳过工具调用"
+            print(skip_msg)
+            think_trace = state["think_trace"][-TRACE_MAX_ITEMS:] + [skip_msg]
+            write_trace_log({"node": "tool_exec_node", "trace_info": skip_msg})
+            return {"think_trace": think_trace}
+
         block_message = check_bom_version_guard(tool_q, state.get("user_query", ""))
         if block_message:
             print(f"【前置拦截】{block_message}")
@@ -559,7 +609,47 @@ def tool_exec_node(state: AgentState):
                 new_local_kb = new_local_kb[-CONTEXT_MAX_LEN:]
                 new_ref = list(set(new_ref + sources))
             obs_list.append(f"chroma_search 返回:{res[:200]}... 来源:{sources}")
+
+    # ========== MES 实时工具 ==========
+    elif curr["tool_name"] in mes_tools.MES_TOOLS:
+        try:
+            mes_func = mes_tools.MES_TOOLS[curr["tool_name"]]
+            if curr["tool_name"] in ("mes_low_stock", "mes_alarm_equipment", "mes_quality_issues"):
+                mes_result = mes_func()
+            else:
+                if not tool_q:
+                    skip_msg = f"tool_exec：task{curr['task_id']} MES工具缺参数，跳过"
+                    print(skip_msg)
+                    think_trace = state["think_trace"][-TRACE_MAX_ITEMS:] + [skip_msg]
+                    write_trace_log({"node": "tool_exec_node", "trace_info": skip_msg})
+                    return {"think_trace": think_trace}
+                mes_result = mes_func(tool_q)
+
+            print(f"【MES 工具】{curr['tool_name']} 返回：{mes_result[:200]}...")
+            new_local_kb += "\n" + mes_result
+            new_local_kb = new_local_kb[-CONTEXT_MAX_LEN:]
+            obs_list.append(f"{curr['tool_name']} 返回:{mes_result[:200]}...")
+            write_trace_log({
+                "node": "tool_exec_node",
+                "action": "mes_tool_call",
+                "tool": curr["tool_name"],
+                "query": tool_q,
+            })
+        except Exception as e:
+            err_msg = f"【MES 工具异常】{curr['tool_name']}: {str(e)}"
+            print(err_msg)
+            obs_list.append(err_msg)
+            write_trace_log({"level": "error", "node": "tool_exec_node", "msg": err_msg})
+
+    # ========== tavily_search ==========
     elif curr["tool_name"] == "tavily_search":
+        if not tool_q:
+            skip_msg = f"tool_exec：task{curr['task_id']} tool_query为空，跳过工具调用"
+            print(skip_msg)
+            think_trace = state["think_trace"][-TRACE_MAX_ITEMS:] + [skip_msg]
+            write_trace_log({"node": "tool_exec_node", "trace_info": skip_msg})
+            return {"think_trace": think_trace}
+
         if AUTO_APPROVE_SEARCH:
             user_input = "y"
         else:
@@ -976,67 +1066,53 @@ async def stream_agent(user_query: str, case_id: str = "stream", user_role: str 
 
 
 # ---------- 快速模式（RAG + 单次 LLM） ----------
-QUICK_PROMPT = """你是制造业MES业务专家。基于参考资料简洁回答。
+QUICK_PROMPT = """你是制造业MES业务专家。基于下面的参考资料回答用户问题。
 
 【硬性要求】
-- 100~150 字以内，绝不超 200 字
-- 直接列 3~4 个要点，不要标题、不要铺垫、不要"综上所述"
-- 不要写"根据参考资料"
+- 回答控制在 150~250 字，不要超过 300 字
+- 直接给结论和要点，不要铺垫、不要"综上所述"
+- 用 2~4 个小节或 3~5 个要点，Markdown 格式
+- 不要重复问题，不要写"根据参考资料"
 
 参考资料：
 {kb_ctx}
 
-问题：{user_query}
+用户问题：{user_query}
 
 回答："""
 
 
-def quick_answer_stream(user_query: str, user_role: str = "admin"):
-    """快速模式（流式）：跳过 Reranker，只做向量 Top-2 + LLM 流式"""
+def quick_answer(user_query: str, user_role: str = "admin") -> str:
+    """快速模式（非流式）：RAG + 单次 LLM，同步返回完整答案。"""
     try:
-        vector_db = _get_vector_db()
-        docs = vector_db.similarity_search(user_query, k=2)
-        kb_ctx = "\n\n".join([d.page_content for d in docs])
+        kb_ctx, _ = chroma_search(user_query)
     except Exception as e:
-        print(f"【quick_answer_stream】检索异常：{e}")
+        print(f"【快速模式】检索异常：{e}")
         kb_ctx = ""
 
     if not kb_ctx:
-        kb_ctx = "（无参考资料）"
+        kb_ctx = "（无参考资料，基于你的领域知识回答）"
+
+    prompt = QUICK_PROMPT.replace("{kb_ctx}", kb_ctx[:800]).replace("{user_query}", user_query)
+    resp = llm.invoke(prompt)
+    return resp.content
+
+
+def quick_answer_stream(user_query: str, user_role: str = "admin"):
+    """快速模式（流式）：RAG + 单次 LLM，同步流式 yield token。"""
+    try:
+        kb_ctx, _ = chroma_search(user_query)
+    except Exception as e:
+        print(f"【快速流式】检索异常：{e}")
+        kb_ctx = ""
+
+    if not kb_ctx:
+        kb_ctx = "（无参考资料，基于你的领域知识回答）"
 
     prompt = QUICK_PROMPT.replace("{kb_ctx}", kb_ctx[:800]).replace("{user_query}", user_query)
     for chunk in llm.stream(prompt):
         if hasattr(chunk, "content") and chunk.content:
             yield chunk.content
-
-
-def quick_answer(user_query: str, user_role: str = "admin") -> str:
-    """极速模式：向量 Top-2（跳过 Reranker）+ 单次 LLM，目标 < 7s"""
-    import time as _t
-    t0 = _t.time()
-
-    # 1. 向量检索（只取 2 条，不做 Rerank）
-    kb_ctx = ""
-    try:
-        vector_db = _get_vector_db()
-        docs = vector_db.similarity_search(user_query, k=2)
-        kb_ctx = "\n\n".join([d.page_content for d in docs])
-        print(f"【quick_answer】检索 Top-2 耗时 {_t.time()-t0:.2f}s")
-    except Exception as e:
-        print(f"【quick_answer】检索异常：{e}")
-
-    if not kb_ctx:
-        kb_ctx = "（无参考资料）"
-
-    # 2. 单次 LLM
-    t1 = _t.time()
-    prompt = QUICK_PROMPT.replace("{kb_ctx}", kb_ctx[:800]).replace("{user_query}", user_query)
-    resp = llm.invoke(prompt)
-    llm_t = _t.time() - t1
-    total_t = _t.time() - t0
-    print(f"【quick_answer】LLM 耗时 {llm_t:.2f}s | 总计 {total_t:.2f}s")
-    return resp.content
-
 # ========== 流式输出辅助函数结束 ==========
 
 
@@ -1047,7 +1123,7 @@ if __name__ == "__main__":
     print("\n==== Running Agent ====\n")
     init_state: AgentState = {
         "case_id": "local_debug",
-        "user_query": "请按照BOM版本V99查询产品P-200的物料清单",
+        "user_query": "工单 WO-20261007-001 现在什么状态？",
         "user_id": "local_user",
         "user_role": "admin",
         "task_list": [],
