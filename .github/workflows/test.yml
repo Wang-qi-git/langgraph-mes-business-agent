@@ -17,6 +17,6 @@ jobs:
           cache: 'pip'
       - name: Install minimal deps
         run: |
-          pip install pytest pytest-cov pytest-asyncio pyjwt requests
+          pip install pytest pytest-cov pytest-asyncio pyjwt requests fastapi
       - name: Run tests
         run: python -m pytest -v --tb=short
