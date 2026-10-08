@@ -35,3 +35,4 @@ mock_mes.db
 htmlcov/
 .pytest_cache/
 .coverage
+docs/INTERVIEW.md
