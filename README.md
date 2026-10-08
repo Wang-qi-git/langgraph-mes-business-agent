@@ -5,7 +5,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10+-blue)]()
 [![LangGraph](https://img.shields.io/badge/LangGraph-0.2+-green)]()
 [![License](https://img.shields.io/badge/License-MIT-yellow)]()
-
+[![Tests](https://github.com/Wang-qi-git/langgraph-mes-business-agent/actions/workflows/test.yml/badge.svg)](https://github.com/Wang-qi-git/langgraph-mes-business-agent/actions/workflows/test.yml)
 ---
 
 ## 📖 目录
