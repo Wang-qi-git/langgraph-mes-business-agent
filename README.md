@@ -65,30 +65,38 @@
 ## 🏗️ 系统架构
 
 ### 容器化部署
-┌─────────────────────────────────────────────────────────────────┐
-│ Docker Compose Network │
-│ │
-│ ┌──────────────┐ HTTP ┌──────────────┐ HTTP ┌────────┐ │
-│ │ Streamlit │ ───────> │ FastAPI │ ──────> │ Mock │ │
-│ │ (前端:8501) │ │ (后端:8000) │ │MES:8001│ │
-│ └──────────────┘ └──────┬───────┘ └────────┘ │
-│ │ /metrics │
-│ ↓ │
-│ ┌─────────────────┐ │
-│ │ Prometheus │ │
-│ │ (:9090) │ │
-│ └────────┬────────┘ │
-│ ↓ │
-│ ┌─────────────────┐ │
-│ │ Grafana │ │
-│ │ (:3000) │ │
-│ └─────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
+
+```mermaid
+flowchart TB
+    subgraph Docker["Docker Compose Network"]
+        direction TB
+        User([用户浏览器]) --> FE[Streamlit 前端<br/>:8501]
+        FE -->|HTTP| BE[FastAPI 后端<br/>:8000]
+        BE -->|HTTP| MES[Mock MES<br/>:8001]
+        BE -->|/metrics| P[Prometheus<br/>:9090]
+        P --> G[Grafana<br/>:3000]
+    end
+    style User fill:#e1f5ff
+    style FE fill:#fff4e1
+    style BE fill:#e8f5e9
+    style MES fill:#f3e5f5
+    style P fill:#ffebee
+    style G fill:#fff9c4
+```
 
 ### 六节点工作流（深度模式）
-Planner → Tool Decide → Tool Exec → Task Execute → Reflect ↺ → Summary
-↑______________________________________|
-(need_more_info=true 时回退)
+
+```mermaid
+flowchart LR
+    P[Planner] --> TD[Tool Decide]
+    TD --> TE[Tool Exec]
+    TE --> TASKE[Task Execute]
+    TASKE --> R[Reflect]
+    R -->|need_more_info=true| TD
+    R -->|收敛| S[Summary]
+    style R fill:#ffe0b2
+    style S fill:#c8e6c9
+```
 
 ### AgentState 关键字段
 
