@@ -1,6 +1,66 @@
-version: '3.8'
-
 services:
+  # ---------- FastAPI 后端 ----------
+  backend:
+    build:
+      context: .
+      target: backend
+    container_name: mes-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      # 挂载模型和向量库（不在镜像里，体积太大）
+      - ./models:/app/models:ro
+      - ./chroma_db:/app/chroma_db
+      - ./md_docs:/app/md_docs:ro
+      - ./pdf_docs:/app/pdf_docs:ro
+      # 挂载 HuggingFace 缓存（关键：让容器复用宿主机的 Embedding 模型）
+      - C:\Users\Honor\.cache\huggingface:/root/.cache/huggingface:ro
+      # 日志持久化
+      - ./audit.log:/app/audit.log
+      - ./trace.jsonl:/app/trace.jsonl
+      - ./sessions.db:/app/sessions.db
+    env_file:
+      - .env
+    environment:
+      - AUTO_APPROVE_SEARCH=true
+      - MES_BASE=http://mock-mes:8001
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+  # ---------- Streamlit 前端 ----------
+  frontend:
+    build:
+      context: .
+      target: frontend
+    container_name: mes-frontend
+    ports:
+      - "8501:8501"
+    environment:
+      - API_BASE=http://backend:8000
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # ---------- Mock MES 系统 ----------
+  mock-mes:
+    build:
+      context: .
+      target: mock-mes
+    container_name: mes-mock
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./mock_mes.db:/app/mock_mes.db
+    restart: unless-stopped
+
+  # ---------- Prometheus ----------
   prometheus:
     image: prom/prometheus:latest
     container_name: mes-prometheus
@@ -14,6 +74,7 @@ services:
       - '--storage.tsdb.retention.time=200h'
     restart: unless-stopped
 
+  # ---------- Grafana ----------
   grafana:
     image: grafana/grafana:latest
     container_name: mes-grafana

@@ -1,10 +1,11 @@
 """
 MES 工具封装 - 把 Mock MES API 包装成 Agent 可调用的函数
 """
+import os
 import requests
 from typing import Optional
 
-MES_BASE = "http://127.0.0.1:8001"
+MES_BASE = os.getenv("MES_BASE", "http://127.0.0.1:8001")
 TIMEOUT = 5
 
 

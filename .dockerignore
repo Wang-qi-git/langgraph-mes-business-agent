@@ -1,0 +1,39 @@
+# 虚拟环境
+venv/
+.venv/
+
+# 模型和向量库（用 volume 挂载）
+models/
+chroma_db/
+
+# 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 日志
+*.log
+trace.jsonl
+audit.log
+
+# 数据库
+*.db
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# 文档
+docs/
+screenshots/
+*.md
+
+# 环境变量（运行时通过 env_file 传入）
+.env
+
+# 其他
+test.log*

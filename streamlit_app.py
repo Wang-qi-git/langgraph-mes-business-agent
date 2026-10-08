@@ -6,7 +6,8 @@ import requests
 import time
 from datetime import datetime
 
-API_BASE = "http://127.0.0.1:8000"
+import os
+API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000")
 
 st.set_page_config(
     page_title="MES 业务分析 Agent",
