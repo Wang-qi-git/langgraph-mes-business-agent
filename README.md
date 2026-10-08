@@ -64,40 +64,100 @@
 
 ## 🏗️ 系统架构
 
-### 容器化部署
+### 容器化部署（Docker Compose 一键启动 5 个容器）
 
 ```mermaid
-flowchart TB
-    subgraph Docker["Docker Compose Network"]
-        direction TB
-        User([用户浏览器]) --> FE[Streamlit 前端<br/>:8501]
-        FE -->|HTTP| BE[FastAPI 后端<br/>:8000]
-        BE -->|HTTP| MES[Mock MES<br/>:8001]
-        BE -->|/metrics| P[Prometheus<br/>:9090]
-        P --> G[Grafana<br/>:3000]
-    end
-    style User fill:#e1f5ff
-    style FE fill:#fff4e1
-    style BE fill:#e8f5e9
-    style MES fill:#f3e5f5
-    style P fill:#ffebee
-    style G fill:#fff9c4
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'primaryColor': '#4A90E2',
+    'primaryTextColor': '#ffffff',
+    'primaryBorderColor': '#2E5C8A',
+    'lineColor': '#F5A623',
+    'secondaryColor': '#50C878',
+    'tertiaryColor': '#E94B3C',
+    'fontSize': '15px',
+    'fontFamily': 'Arial, sans-serif'
+  }
+}}%%
+flowchart LR
+    User([👤 用户<br/>浏览器])
+    FE[🎨 Streamlit<br/>前端 :8501]
+    BE[⚙️ FastAPI<br/>后端 :8000]
+    MES[🏭 Mock MES<br/>:8001]
+    P[📊 Prometheus<br/>:9090]
+    G[📈 Grafana<br/>:3000]
+
+    User --> FE
+    FE -->|HTTP| BE
+    BE -->|实时查询| MES
+    BE -->|/metrics| P
+    P -->|数据源| G
+
+    style User fill:#F5A623,stroke:#B87B1A,color:#fff
+    style FE fill:#4A90E2,stroke:#2E5C8A,color:#fff
+    style BE fill:#50C878,stroke:#2E7D4F,color:#fff
+    style MES fill:#9B59B6,stroke:#6C3483,color:#fff
+    style P fill:#E94B3C,stroke:#A93226,color:#fff
+    style G fill:#F39C12,stroke:#B9770E,color:#fff
 ```
 
 ### 六节点工作流（深度模式）
 
 ```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'primaryColor': '#4A90E2',
+    'primaryTextColor': '#ffffff',
+    'primaryBorderColor': '#2E5C8A',
+    'lineColor': '#F5A623',
+    'fontSize': '15px',
+    'fontFamily': 'Arial, sans-serif'
+  }
+}}%%
 flowchart LR
-    P[Planner] --> TD[Tool Decide]
-    TD --> TE[Tool Exec]
-    TE --> TASKE[Task Execute]
-    TASKE --> R[Reflect]
-    R -->|need_more_info=true| TD
-    R -->|收敛| S[Summary]
-    style R fill:#ffe0b2
-    style S fill:#c8e6c9
+    P[🎯 Planner<br/>拆解任务]
+    TD[🔧 Tool Decide<br/>选择工具]
+    TE[⚡ Tool Exec<br/>执行检索]
+    TASKE[📝 Task Execute<br/>生成子答案]
+    R[🔄 Reflect<br/>质量评估]
+    S[📋 Summary<br/>汇总报告]
+
+    P --> TD
+    TD --> TE
+    TE --> TASKE
+    TASKE --> R
+    R -->|need_more_info<br/>= true| TD
+    R -->|收敛| S
+
+    style P fill:#4A90E2,stroke:#2E5C8A,color:#fff
+    style TD fill:#5DADE2,stroke:#2E5C8A,color:#fff
+    style TE fill:#48C9B0,stroke:#1ABC9C,color:#fff
+    style TASKE fill:#58D68D,stroke:#28B463,color:#fff
+    style R fill:#F5A623,stroke:#B87B1A,color:#fff
+    style S fill:#E74C3C,stroke:#A93226,color:#fff
 ```
 
+### 5 个容器职责
+
+| 容器 | 端口 | 职责 |
+|------|------|------|
+| `mes-frontend` | 8501 | Streamlit 前端（UI + 登录）|
+| `mes-backend` | 8000 | FastAPI 后端（JWT + 会话 + Agent）|
+| `mes-mock` | 8001 | Mock MES 系统（工单/库存/设备数据）|
+| `mes-prometheus` | 9090 | 指标采集（每 5 秒抓 `/metrics`）|
+| `mes-grafana` | 3000 | 可视化仪表盘 |
+
+### AgentState 关键字段
+
+| 字段 | 说明 |
+|------|------|
+| `user_query` / `user_role` | 用户问题 + JWT 解析的角色 |
+| `task_list` | 任务列表（含 `task_id` / `desc` / `status` / `task_output`）|
+| `context_local_kb` | 本地知识库 + MES 实时数据 |
+| `ref_docs` | 参考文档来源 |
+| `loop_count` / `need_more_info` | Reflection 循环控制 |
 ### AgentState 关键字段
 
 | 字段 | 说明 |
