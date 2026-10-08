@@ -22,3 +22,6 @@ pyjwt>=2.8.0
 cachetools>=5.3.0
 prometheus-client>=0.19.0
 prometheus-fastapi-instrumentator>=6.1.0
+pytest>=8.0.0
+pytest-cov>=5.0.0
+pytest-asyncio>=0.23.0

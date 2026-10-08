@@ -1,0 +1,18 @@
+[run]
+omit =
+    tests/*
+    venv/*
+    __pycache__/*
+    models/*
+    chroma_db/*
+    md_docs/*
+    pdf_docs/*
+    htmlcov/*
+    .pytest_cache/*
+
+[report]
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    raise NotImplementedError
+    if __name__ == .__main__.:

@@ -30,3 +30,8 @@ sessions.db
 models/
 sessions.db
 mock_mes.db
+
+# 测试产物
+htmlcov/
+.pytest_cache/
+.coverage
