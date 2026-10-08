@@ -54,8 +54,8 @@
 - 🔐 **JWT 认证**：Token 鉴权，从 JWT 解析角色，前端不再传 `user_role`
 - 💬 **多会话隔离**：URL-based session + SQLite 持久化，刷新不丢、多标签独立
 - 📊 **Prometheus + Grafana**：6 个业务指标 + 实时仪表盘
-- 🐳 **一键部署**：Docker Compose 启动 5 个容器（backend / frontend / mock-mes / prometheus / grafana）
-- ✅ **单元测试**：15 个测试，核心模块覆盖率 84%+（JWT、会话、MES 工具）
+- 🐳 **一键部署**：Docker Compose 启动 5 个容器
+- ✅ **单元测试**：15 个测试，核心模块覆盖率 84%+
 - 📝 **审计日志**：所有查询、工具调用、权限决策落地 `audit.log`
 - 🔄 **日志轮转**：超过 10MB 自动轮转，保留 3 份
 - 📡 **三级降级**：Reranker / MES / Tavily 任一故障时服务仍可用
@@ -64,7 +64,7 @@
 
 ## 🏗️ 系统架构
 
-### 容器化部署（V5.2）
+### 容器化部署
 ┌─────────────────────────────────────────────────────────────────┐
 │ Docker Compose Network │
 │ │
@@ -89,7 +89,6 @@
 Planner → Tool Decide → Tool Exec → Task Execute → Reflect ↺ → Summary
 ↑______________________________________|
 (need_more_info=true 时回退)
-
 
 ### AgentState 关键字段
 
@@ -124,7 +123,7 @@ Planner → Tool Decide → Tool Exec → Task Execute → Reflect ↺ → Summa
 
 ---
 
-## 📊 监控体系（V5.1）
+## 📊 监控体系
 
 **Prometheus** 每 5 秒抓取 FastAPI `/metrics`，**Grafana** 实时可视化。
 
@@ -287,14 +286,12 @@ cd langgraph-mes-business-agent
 
 # 配置 .env（参考 .env.example）
 cp .env.example .env
-# 编辑 .env 填入 API Key
 
 # 一键启动 5 个容器
 docker-compose up -d
 
 # 等 backend healthy（约 90s）
 docker-compose ps
-
 访问入口：
 
 服务	地址	账号
@@ -332,9 +329,7 @@ langgraph-mes-business-agent/
 ├── Dockerfile                   # 多阶段构建
 ├── docker-compose.yml           # 5 容器编排
 ├── prometheus.yml               # 监控抓取配置
-├── .dockerignore
-├── .coveragerc
-├── pytest.ini
+├── .dockerignore / .coveragerc / pytest.ini
 ├── .env / .env.example
 ├── .gitignore
 │
@@ -359,12 +354,32 @@ langgraph-mes-business-agent/
 │   └── conftest.py
 │
 ├── .github/workflows/test.yml   # CI/CD（GitHub Actions）
-├── md_docs/                     # Markdown 规范文档
-├── pdf_docs/                    # PDF 规范文档
-├── chroma_db/                   # 向量库（gitignore）
-├── models/                      # 本地模型（gitignore）
+├── md_docs/ / pdf_docs/         # 知识库源
+├── chroma_db/ / models/         # gitignore
 ├── screenshots/                 # 截图
 └── docs/
     ├── CHANGELOG.md             # V1→V5.5 版本演进
     └── INTERVIEW.md             # 面试指南（6 个 STAR 故事）
 
+🛣️ 后续规划
+短期
+□ 覆盖率提升：mes_tools.py 46% → 75%
+□ CI 中加 Docker 构建验证（避免镜像构建失败）
+□ 前端体验优化（复制答案、继续追问）
+中期
+□ 接入真实 MES API：把 mock_mes_api.py 换成真实系统
+□ 多模态：支持上传设备照片识别故障
+□ CI/CD 增强：推 tag 时自动构建 Docker 镜像并推送
+□ K8s 部署：从单机 Docker Compose 到 K8s
+长期
+□ Agent 主动推送：监控 SPC 异常主动通知工程师
+□ 企业微信/钉钉集成
+□ 知识库扩充至 50+ 份文档
+
+⚠️ 已知限制
+首次启动 50~60s 预热：本地模型加载成本，一次性
+深度模式 40~60s：Reflection 循环 + Reranker 精排的必然代价
+整体测试覆盖率 8%：核心模块 84%+，graph_agent_skeleton.py 因模型加载成本不测
+Grafana 数据在容器重建后丢失：需重新导入仪表盘
+单机部署：不支持多副本水平扩展
+依赖外部 API：DeepSeek / Tavily / LangSmith 任一故障都会影响服务
