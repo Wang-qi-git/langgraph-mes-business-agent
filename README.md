@@ -359,7 +359,7 @@ langgraph-mes-business-agent/
 ├── screenshots/                 # 截图
 └── docs/
     ├── CHANGELOG.md             # V1→V5.5 版本演进
-    └── INTERVIEW.md             # 面试指南（6 个 STAR 故事）
+
 
 🛣️ 后续规划
 短期
