@@ -19,6 +19,7 @@ from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from tavily import TavilyClient
 from cachetools import LRUCache
+from prometheus_client import Counter, Histogram
 import mes_tools
 
 # 加载 .env 环境变量
@@ -122,6 +123,33 @@ def _rotate_if_needed(path: str, max_mb: int = LOG_MAX_MB, backups: int = LOG_BA
     except Exception as e:
         print(f"【日志轮转失败】{path}: {e}")
 
+# ====================== Prometheus 业务指标 ======================
+CACHE_HITS = Counter("mes_cache_hits_total", "缓存命中次数")
+CACHE_MISSES = Counter("mes_cache_misses_total", "缓存未命中次数")
+
+TOOL_CALLS = Counter(
+    "mes_tool_calls_total",
+    "工具调用次数（按工具、角色、状态）",
+    ["tool", "role", "status"],
+)
+
+LLM_TOKENS = Counter(
+    "mes_llm_tokens_total",
+    "LLM Token 消耗（input/output）",
+    ["kind"],
+)
+
+QUICK_MODE_REQUESTS = Counter(
+    "mes_quick_mode_requests_total",
+    "快速模式请求数",
+    ["cached"],
+)
+
+MES_TOOL_CALLS = Counter(
+    "mes_tool_calls_external_total",
+    "外部 MES 工具调用次数",
+    ["tool", "status"],
+)
 
 # ====================== 答案缓存 ======================
 _ANSWER_CACHE = LRUCache(maxsize=CACHE_MAX_SIZE)
@@ -132,7 +160,12 @@ def _cache_key(query: str, user_role: str) -> str:
 
 
 def _cache_get(query: str, user_role: str):
-    return _ANSWER_CACHE.get(_cache_key(query, user_role))
+    val = _ANSWER_CACHE.get(_cache_key(query, user_role))
+    if val is not None:
+        CACHE_HITS.inc()
+    else:
+        CACHE_MISSES.inc()
+    return val
 
 
 def _cache_set(query: str, user_role: str, answer: str):
@@ -152,6 +185,8 @@ def print_token_usage(resp):
         total_tok = usage.get("total_tokens", 0)
         cost = (in_tok / 1000) * PRICE_IN + (out_tok / 1000) * PRICE_OUT
         print(f"【Token统计】输入:{in_tok}, 输出:{out_tok}, 合计:{total_tok}, 预估本轮费用:{cost:.6f} 元")
+        LLM_TOKENS.labels(kind="input").inc(in_tok)
+        LLM_TOKENS.labels(kind="output").inc(out_tok)
         write_trace_log({
             "level": "info",
             "func": "token_stat",
@@ -683,6 +718,7 @@ def tool_exec_node(state: AgentState):
     user_role = state.get("user_role", "operator")
     user_id = state.get("user_id", "anonymous")
     tool_name = curr["tool_name"]
+    TOOL_CALLS.labels(tool=tool_name, role=user_role, status="attempt").inc()
 
     if not check_permission(user_role, tool_name):
         denied_msg = f"【权限拒绝】用户 {user_id}（角色：{user_role}）无权调用工具 {tool_name}"
@@ -758,7 +794,7 @@ def tool_exec_node(state: AgentState):
                     write_trace_log({"node": "tool_exec_node", "trace_info": skip_msg})
                     return {"think_trace": skip_msg}
                 mes_result = mes_func(tool_q)
-
+            MES_TOOL_CALLS.labels(tool=curr["tool_name"], status="success").inc()
             print(f"【MES 工具】{curr['tool_name']} 返回：{mes_result[:200]}...")
             new_local_kb += "\n" + mes_result
             new_local_kb = new_local_kb[-CONTEXT_MAX_LEN:]
@@ -770,6 +806,7 @@ def tool_exec_node(state: AgentState):
                 "query": tool_q,
             })
         except Exception as e:
+            MES_TOOL_CALLS.labels(tool=curr["tool_name"], status="fail").inc()
             err_msg = f"【MES 工具异常】{curr['tool_name']}: {str(e)}"
             print(err_msg)
             new_local_kb += f"\n【MES 系统暂时不可用】{curr['tool_name']} 查询失败，请基于现有信息回答，不要编造实时数据。"
@@ -1222,7 +1259,10 @@ def quick_answer(user_query: str, user_role: str = "admin") -> str:
     cached = _cache_get(user_query, user_role)
     if cached is not None:
         print(f"【缓存命中】{user_query[:30]}...")
+        QUICK_MODE_REQUESTS.labels(cached="true").inc()
         return cached
+
+    QUICK_MODE_REQUESTS.labels(cached="false").inc()
 
     # 2. 向量检索 Top-2（跳过 Reranker）
     kb_ctx = ""
@@ -1254,8 +1294,11 @@ def quick_answer_stream(user_query: str, user_role: str = "admin"):
     cached = _cache_get(user_query, user_role)
     if cached is not None:
         print(f"【缓存命中-流式】{user_query[:30]}...")
+        QUICK_MODE_REQUESTS.labels(cached="true").inc()
         yield cached
         return
+
+    QUICK_MODE_REQUESTS.labels(cached="false").inc()
 
     # 2. 向量检索 Top-2
     kb_ctx = ""

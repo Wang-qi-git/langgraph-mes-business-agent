@@ -20,3 +20,5 @@ uvicorn
 FlagEmbedding
 pyjwt>=2.8.0
 cachetools>=5.3.0
+prometheus-client>=0.19.0
+prometheus-fastapi-instrumentator>=6.1.0

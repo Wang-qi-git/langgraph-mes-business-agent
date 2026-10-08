@@ -22,7 +22,7 @@
 - [项目结构](#-项目结构)
 - [后续规划](#-后续规划)
 - | 会话存储 | SQLite | 轻量、零依赖 |
-多会话隔离：URL-based session + SQLite 持久化，刷新不丢、多标签独立
+
 
 ---
 
@@ -50,8 +50,8 @@
 - ⚡ **模型预热机制**：后端启动时一次性加载，用户请求全部享受稳态性能
 - 🌐 **联网搜索 HITL**：Tavily 搜索需人工确认，防止滥用
 - 📊 **LangSmith 全链路追踪**：Token 统计、节点耗时、评估分数一键可视
-
----
+- 📊 **多会话隔离：URL-based session + SQLite 持久化，刷新不丢、多标签独立
+- 📊 **Prometheus + Grafana 监控**：暴露 QPS、延迟、缓存命中率、工具调用分布等业务指标
 
 ## 🏗️ 系统架构
 
@@ -97,6 +97,13 @@ need_more_info?
 │ Summary │ 汇总报告
 └──────┬──────┘
 ↓
+### 监控体系
+
+- **Prometheus** 抓取 FastAPI `/metrics` 端点（5 秒间隔）
+- **Grafana** 实时可视化：QPS、P50/P95/P99 延迟、错误率、缓存命中率
+- **自定义业务指标**：`mes_cache_hits_total`、`mes_tool_calls_total`、`mes_llm_tokens_total` 等
+
+![Grafana Dashboard](screenshots/07_grafana_dashboard.png)
 END
 
 

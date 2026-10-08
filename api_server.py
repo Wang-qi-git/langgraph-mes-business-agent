@@ -11,6 +11,7 @@ import time
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from graph_agent_skeleton import (
     app as agent_app,
@@ -292,6 +293,13 @@ def deep_chat(
 @api.get("/stats/cache")
 def cache_stats(user: dict = Depends(auth.get_current_user)):
     return get_cache_stats()
+
+# ==================== Prometheus 监控 ====================
+Instrumentator(
+    should_group_status_codes=True,
+    should_ignore_untemplated=True,
+    excluded_handlers=["/metrics", "/health"],
+).instrument(api).expose(api, endpoint="/metrics", include_in_schema=False)
 
 
 if __name__ == "__main__":
