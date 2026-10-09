@@ -36,3 +36,4 @@ htmlcov/
 .pytest_cache/
 .coverage
 docs/INTERVIEW.md
+learning/

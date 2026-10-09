@@ -135,6 +135,37 @@ def query_quality_issues(status: str = "处理中") -> str:
         )
     return "\n".join(lines)
 
+def query_order_readiness(order_id: str) -> str:
+    """查询工单齐套情况（跨表联动：工单+BOM+库存）"""
+    order_id = order_id.strip().upper()
+    data = _get(f"/mes/work-orders/{order_id}/readiness")
+    if data is None:
+        return f"【MES 查询失败】无法连接到 MES 系统，请稍后重试。"
+    if data.get("_not_found"):
+        return f"【MES 查询结果】工单 {order_id} 不存在，请确认单号。"
+
+    if data.get("readiness_rate") is None:
+        return f"【工单齐套分析】\n{data.get('message', '无法分析')}"
+
+    lines = [
+        f"【工单齐套分析】",
+        f"- 工单号：{data['order_id']}",
+        f"- 产品：{data['product']}",
+        f"- 计划数量：{data['quantity']}",
+        f"- 齐套率：{data['readiness_rate']}%（{data['ok_items']}/{data['total_items']} 项物料充足）",
+        f"- 齐套状态：{data['status']}",
+    ]
+
+    if data["shortage"]:
+        lines.append("- 缺料清单：")
+        for s in data["shortage"]:
+            lines.append(
+                f"  · {s['sku']} {s['name']}：需要 {s['required']}，现有 {s['available']}，缺 {s['gap']}"
+            )
+    else:
+        lines.append("- ✅ 所有物料齐套，可以开工")
+
+    return "\n".join(lines)
 
 # 工具注册表（供 Agent 调用）
 MES_TOOLS = {
@@ -144,4 +175,5 @@ MES_TOOLS = {
     "mes_low_stock": query_low_stock,
     "mes_alarm_equipment": query_alarm_equipment,
     "mes_quality_issues": query_quality_issues,
+    "mes_order_readiness": query_order_readiness, 
 }

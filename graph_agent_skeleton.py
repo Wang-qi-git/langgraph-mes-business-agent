@@ -416,16 +416,19 @@ ROLE_PERMISSIONS = {
         "chroma_search",
         "mes_work_order", "mes_inventory", "mes_equipment",
         "mes_low_stock", "mes_alarm_equipment", "mes_quality_issues",
+        "mes_order_readiness",
     ],
     "supervisor": [
         "chroma_search", "tavily_search",
         "mes_work_order", "mes_inventory", "mes_equipment",
         "mes_low_stock", "mes_alarm_equipment", "mes_quality_issues",
+        "mes_order_readiness",
     ],
     "admin": [
         "chroma_search", "tavily_search",
         "mes_work_order", "mes_inventory", "mes_equipment",
         "mes_low_stock", "mes_alarm_equipment", "mes_quality_issues",
+        "mes_order_readiness",
     ],
 }
 
@@ -447,6 +450,10 @@ def check_permission(user_role: str, tool_name: str) -> bool:
 
 # ====================== 快速模式 MES 意图识别 ======================
 _MES_INTENT_PATTERNS = {
+    "mes_order_readiness": [
+        r"齐套", r"能开工", r"能否开工", r"能不能开工", 
+        r"可以开工", r"缺什么料", r"物料齐套", r"能投产", r"能生产"
+    ],
     "mes_low_stock":       [r"低于安全库存", r"低库存", r"库存不足", r"要补货", r"缺料"],
     "mes_alarm_equipment": [r"设备报警", r"设备异常", r"报警的设备", r"维护中", r"故障设备"],
     "mes_quality_issues":  [r"质量问题", r"异常批次", r"质量异常", r"质量事故"],
@@ -474,6 +481,10 @@ def detect_mes_intent(query: str) -> tuple[str, str]:
                         tool_q = m.group(0).upper()
                 elif tool_name == "mes_equipment":
                     m = re.search(r"M-\d+", query, re.IGNORECASE)
+                    if m:
+                        tool_q = m.group(0).upper()
+                elif tool_name == "mes_order_readiness":
+                    m = re.search(r"WO-[\w-]+", query, re.IGNORECASE)
                     if m:
                         tool_q = m.group(0).upper()
                 return tool_name, tool_q
@@ -531,6 +542,7 @@ TOOL_DECIDE_PROMPT = """
 - mes_low_stock：查所有低库存物料（无参数，tool_query 填空）
 - mes_alarm_equipment：查所有报警/维护中的设备（无参数，tool_query 填空）
 - mes_quality_issues：查处理中的质量问题（无参数，tool_query 填空）
+- mes_order_readiness：查工单齐套分析（工单+BOM+库存跨表联动）。tool_query 填工单号
 - no_tool：无需工具
 
 【决策原则】
@@ -541,6 +553,7 @@ TOOL_DECIDE_PROMPT = """
 5. 问"规范是什么/8D要求/SPC原理" → chroma_search
 6. 需要最新资讯 → tavily_search
 7. 已有信息足够回答 → no_tool
+8. 问"工单能否开工/物料是否齐套/缺什么料" → mes_order_readiness
 
 输出 JSON：{"tool":"xxx","tool_query":"xxx"}
 """
