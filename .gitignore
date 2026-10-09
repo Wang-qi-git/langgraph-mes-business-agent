@@ -37,3 +37,4 @@ htmlcov/
 .coverage
 docs/INTERVIEW.md
 learning/
+day1_practice*.py
